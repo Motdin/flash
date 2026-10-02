@@ -1,73 +1,43 @@
-# Morpho Atomic Arbitrage POC
+# Morpho Multi-DEX Atomic Arbitrage & Liquidation Executor (`MorphoAtomicArbPOC`)
 
-POC ini membuktikan alur atomik berikut:
-
-```text
-owner
-  -> Morpho flashLoan(loanToken, amount)
-  -> router A: loanToken -> intermediateToken
-  -> router B: intermediateToken -> loanToken
-  -> cek minOut + minProfit
-  -> approve principal ke Morpho
-  -> Morpho menarik principal
-  -> profit dikirim ke profitReceiver
-```
-
-## File
-
-- Contract: `src/poc/MorphoAtomicArbPOC.sol`
-- Peta ABI DEX: `poc/DEX-SWAP-ABI-MAP.md`
-- Interface adapter: `src/poc/DexSwapInterfaces.sol`
-- Test: `test/MorphoAtomicArbPOC.t.sol`
-
-Contract dibuat self-contained agar nanti mudah dipindahkan menjadi satu-file Gist.
-
-POC saat ini langsung kompatibel dengan router Uniswap V2 dan Sushi V2. DEX V3,
-Universal Router, Aerodrome/Velodrome, Balancer, dan Curve sudah dipetakan tetapi
-memerlukan adapter masing-masing sebelum dapat dipakai.
-
-## Menjalankan test
-
-```bash
-cd Morpho/evm
-forge build
-forge test --match-contract MorphoAtomicArbPOCTest -vv
-```
-
-Test lokal memakai dua mock router dengan rate berikut:
+`src/poc/MorphoAtomicArbPOC.sol` implements atomic zero-fee Morpho Blue flashloan arbitrage across multiple DEX architectures (2-leg and N-hop triangular paths) as well as atomic Morpho Blue liquidations:
 
 ```text
-1,000 token A -> 2,000 token B -> 1,100 token A
-principal     -> 1,000 token A
-profit        ->   100 token A
+1. Multi-DEX & Multi-Hop Arbitrage Flow:
+   owner / operator
+     -> Morpho.flashLoan(loanToken, loanAmount)
+     -> Hop 1..N (V2 / V3 / Aerodrome / Curve / Direct V3 Pool):
+          loanToken -> token1 -> ... -> loanToken
+     -> Verify minAmountOut at each step and finalBalance >= balanceBefore + loanAmount + minProfit
+     -> Ensure allowance to Morpho (skips SSTORE if pre-approved)
+     -> Transfer realized profit to profitReceiver
+
+2. Atomic Liquidation Flow:
+   owner / operator
+     -> Morpho.liquidate(marketParams, borrower, seizedAssets, repaidShares, callbackData)
+     -> onMorphoLiquidate(repaidAssets, data):
+          Swap seized collateralToken -> loanToken via allowed router
+          Verify finalBalance >= balanceBefore + repaidAssets + minProfit
+          Ensure allowance of repaidAssets to Morpho
+     -> Transfer realized liquidation profit to profitReceiver
 ```
 
-## Parameter eksekusi
+## Supported Router Kinds (`RouterKind` Enum)
 
-`executeArbitrage` menerima satu struct:
+| Enum Value | ID | Supported Protocols | Execution Method |
+|---|---:|---|---|
+| `RouterKind.V2` | `0` | Uniswap V2, SushiSwap V2, BaseSwap V2, Camelot V2 | `swapExactTokensForTokens(amountIn, amountOutMin, path, address(this), deadline)` |
+| `RouterKind.V3_LEGACY` | `1` | Uniswap V3 SwapRouter, SushiSwap V3 | `exactInputSingle` (with `deadline` in struct & `uint24 fee`) |
+| `RouterKind.V3_ROUTER02` | `2` | Uniswap SwapRouter02 (Base / L2 deployments) | `exactInputSingle` (without `deadline` in struct & `uint24 fee`) |
+| `RouterKind.AERODROME` | `3` | Aerodrome (Base), Velodrome V2 (Optimism) | `swapExactTokensForTokens(amountIn, amountOutMin, Route[], address(this), deadline)` |
+| `RouterKind.CURVE` | `4` | Curve StableSwap / CryptoSwap Pools | `exchange(int128 i, int128 j, uint256 dx, uint256 min_dy)` (indices `i, j` packed in `hop.fee`) |
+| `RouterKind.V3_DIRECT_POOL` | `5` | Direct Uniswap V3 Liquidity Pools (No Router) | `pool.swap(...)` + `uniswapV3SwapCallback` |
 
-- `loanToken`: aset yang dipinjam dan dikembalikan ke Morpho.
-- `intermediateToken`: aset di antara swap pertama dan kedua.
-- `firstRouter` dan `secondRouter`: router V2-compatible yang sudah di-allowlist.
-- `loanAmount`: principal flashloan dalam raw token units.
-- `minIntermediateAmount`: batas output swap pertama.
-- `minFinalAmount`: batas output swap kedua.
-- `minProfit`: profit minimum dalam unit `loanToken`.
-- `deadline`: batas waktu kedua swap.
-- `profitReceiver`: penerima profit setelah principal dilunasi.
+## Gas Optimization & Security Invariants
 
-## Guard yang sudah tersedia
-
-- Hanya owner yang dapat memulai arbitrase atau mengubah allowlist.
-- Callback hanya menerima panggilan dari Morpho yang dikonfigurasi saat deployment.
-- Callback terikat ke hash parameter, token, dan nominal loan aktif.
-- Token serta kedua router wajib masuk allowlist.
-- Tidak ada arbitrary-call atau arbitrary-calldata execution.
-- Kedua swap memiliki `amountOutMin` dan `deadline`.
-- Seluruh intermediate token hasil swap pertama harus digunakan pada swap kedua.
-- Transaksi revert apabila principal dan `minProfit` tidak tersedia setelah swap.
-- Profit baru dikirim setelah Morpho berhasil menarik principal.
-
-## Batas POC
-
-Belum ada quote scanner, route discovery, gas-to-token conversion, private transaction/MEV protection, router adapter non-V2, deployment script khusus, atau fork test terhadap DEX nyata. Jangan broadcast ke mainnet sebelum memilih chain dan dua venue, memverifikasi ABI/address router, serta menjalankan fork simulation pada block terbaru.
+- **Gas-Saving Pre-Approvals (`setRouterPreApproval` / `batchSetRouterPreApprovals` / `_ensureAllowance`)**: Checks existing ERC-20 `allowance(address(this), spender)` via `staticcall` and skips the expensive `approve()` `SSTORE` during flashloan callbacks when allowance is already `>= needed`.
+- **Direct V3 Pool Swaps (`uniswapV3SwapCallback`)**: Bypasses periphery router contracts when `RouterKind.V3_DIRECT_POOL` is selected, verifying `msg.sender == activeV3PoolCallback`.
+- **Access Control (`onlyOwnerOrOperator`)**: Only `owner` or the delegated VPS `operator` (`setOperator(address)`) can initiate arbitrage/liquidations or update allowlists. Only `owner` can change the `operator`, pause the contract, or rescue tokens.
+- **Callback Authenticity**: `onMorphoFlashLoan` and `onMorphoLiquidate` strictly require `msg.sender == morpho`, an active callback mode (`ARB_V2`, `ARB_MULTIDEX`, `ARB_MULTIHOP`, or `LIQUIDATION`), and a matching `keccak256(data) == activeRouteHash`.
+- **Explicit Allowlists**: Every token and router/pool must be explicitly enabled in `allowedToken` and `allowedRouter`.
+- **Zero Residual & Strict Profit Check**: Reverts with `InsufficientProfit` if the final loan token balance does not cover both full Morpho repayment and `minProfit`.

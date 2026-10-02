@@ -1,48 +1,48 @@
-# EVM Flash Loan Contract
+# EVM Smart Contracts (`FlashLoanExecutor` & `MorphoAtomicArbPOC`)
 
-POC arbitrase dua router tersedia di [`poc/README.md`](poc/README.md). POC tersebut terpisah dari executor no-op yang digunakan CLI saat ini.
+This folder contains the Solidity smart contracts, deployment scripts, pre-compiled artifacts, and Foundry test suites for the Morpho Blue toolkit:
 
-`src/FlashLoanExecutor.sol` adalah executor portable untuk Morpho Blue. Bytecode yang sama dapat dideploy ke semua chain EVM; constructor menerima alamat Morpho lokal dan allowlist token.
+1. **`src/FlashLoanExecutor.sol`**: Minimal, portable, zero-protocol-fee Morpho Blue flashloan executor deployed across 10 EVM chains.
+2. **`src/poc/MorphoAtomicArbPOC.sol`**: Multi-DEX atomic arbitrage (`V2`, `V3_LEGACY`, `V3_ROUTER02`, `AERODROME`) and Morpho Blue liquidation executor (`onMorphoLiquidate`) with owner + delegated VPS `operator` access control.
 
-## Deploy parameters
+## Compiling Contracts
 
-```text
-morpho_       = address Morpho Blue pada chain target
-initialTokens = daftar token yang boleh dipinjam (USDC, USDT, DAI, atau stablecoin lain yang diverifikasi)
+You can compile both contracts either with the embedded Node.js `solc` compiler (no Foundry installation required) or with Foundry:
+
+```bash
+# Option A: Using the embedded Node.js solc compiler
+cd ../tools
+npm run compile:contracts
+
+# Option B: Using Foundry
+cd ../evm
+forge build
+forge test -vv
 ```
 
-## Dry-run call
+## Deploying via TypeScript CLI (Recommended)
 
-Panggil `flashLoan(USDC, 100e6)`. Contract membentuk callback data secara internal, meminjam, lalu mengembalikan tepat principal; tidak ada DEX atau arbitrary call di antara callback.
+```bash
+cd ../tools
 
-## Safety
+# Deploy or sync FlashLoanExecutor
+npm run cli -- setup --chain base --select USDC,WETH --broadcast
 
-- owner-only initiation and rescue
-- provider and token allowlists
-- pause switch
-- exact repayment invariant
-- no arbitrary external call path
+# Deploy or sync MorphoAtomicArbPOC (Multi-DEX Arbitrage & Liquidation)
+npm run cli -- setup-arb --chain base --select USDC,WETH --broadcast
+```
 
-Sebelum deploy, verifikasi alamat Morpho dan token pada chain target dari [Morpho deployment registry](https://docs.morpho.org/developers/contracts/addresses/) dan lakukan fork test.
-
-## Deploy
+## Manual Deployment via Foundry Script
 
 ```bash
 export MORPHO_ADDRESS=0x...
-export TOKEN_ADDRESS=0x...       # token pertama
-export TOKEN_ADDRESS_2=0x...     # opsional
-export TOKEN_ADDRESS_3=0x...     # opsional
+export TOKEN_ADDRESSES=0xTokenA,0xTokenB
+export ROUTER_ADDRESSES=0xRouterA,0xRouterB
 export PRIVATE_KEY=0x...
-forge script script/Deploy.s.sol:Deploy --rpc-url "$ETHEREUM_RPC_URL" --broadcast
+
+# Deploy FlashLoanExecutor
+forge script script/Deploy.s.sol:Deploy --rpc-url "$BASE_RPC_URL" --broadcast
+
+# Deploy MorphoAtomicArbPOC
+forge script script/Deploy.s.sol:DeployArb --rpc-url "$BASE_RPC_URL" --broadcast
 ```
-
-Untuk allowlist dinamis tanpa batas tiga token, gunakan satu variabel comma-separated:
-
-```bash
-export TOKEN_ADDRESSES=0xTokenA,0xTokenB,0xTokenC,0xTokenD
-forge script script/Deploy.s.sol:Deploy --rpc-url "$ETHEREUM_RPC_URL" --broadcast
-```
-
-CLI TypeScript di `../tools/` menggunakan jalur dinamis yang sama dan merupakan cara deploy yang direkomendasikan.
-
-Ulangi per chain dengan RPC dan address registry masing-masing. Simpan hasil executor di `deployments.json`; jangan broadcast jika provider/token masih kosong.

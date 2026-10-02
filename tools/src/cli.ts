@@ -17,10 +17,16 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { evmChains, type EvmChainConfig } from './config/chains.js';
+import { getRoutersForChain } from './config/dex-routers.js';
 import { loadToolEnv } from './config/env.js';
+import type { OperatorMode } from './agent/llm-operator.js';
+import { runWatchDaemon } from './agent/watcher.js';
+import { compileContracts } from './commands/compile-contracts.js';
+import { scanChainOpportunities } from './morpho/dex-scanner.js';
 import { scanMorphoBalances, type ScanResult, type ScannedAsset } from './morpho/scanner.js';
 import { centerBlock, color, joinBlocks, promptText, renderBanner, renderTable, terminalLink, ui } from './ui/index.js';
 import {
+  arbArtifactPath,
   artifactPath,
   deploymentFor,
   loadDeployments,
@@ -368,11 +374,19 @@ async function deployExecutor(
   morpho: Address,
   selected: ScannedAsset[],
 ): Promise<{ executor: Address; hash: Hash; block: bigint; gasUsed: bigint }> {
-  const artifact = JSON.parse(await readFile(artifactPath, 'utf8')) as {
+  let artifactRaw: string;
+  try {
+    artifactRaw = await readFile(artifactPath, 'utf8');
+  } catch {
+    ui.info('Mengompilasi kontrak Solidity dengan solc...');
+    await compileContracts();
+    artifactRaw = await readFile(artifactPath, 'utf8');
+  }
+  const artifact = JSON.parse(artifactRaw) as {
     abi: Abi;
     bytecode: { object: Hex };
   };
-  if (!artifact.bytecode.object || artifact.bytecode.object === '0x') throw new Error('artifact bytecode kosong; jalankan forge build');
+  if (!artifact.bytecode.object || artifact.bytecode.object === '0x') throw new Error('artifact bytecode kosong; jalankan npm run compile:contracts');
   const chainConfig = viemChain(chain, rpc);
   const account = privateKeyToAccount(privateKey());
   const publicClient = createPublicClient({ chain: chainConfig, transport: readTransport(chain, rpc) });
@@ -610,6 +624,192 @@ async function runFlashLoan(args: ParsedArgs): Promise<void> {
   console.log(centerBlock(`${color.green('✓')} FLASHLOAN  ${color.dim(shortHash(hash))}  ${terminalLink('OPEN ↗', flashloanUrl)}`));
 }
 
+async function setupArb(args: ParsedArgs): Promise<void> {
+  const { result, registry, record } = await runScan(args);
+  printScan(result, hasFlag(args, 'compact-ui'));
+  const eligible = result.assets.filter((asset) => asset.eligible);
+  if (!eligible.length) throw new Error('setup-arb berhenti: tidak ada aset eligible');
+  const selected = flag(args, 'select')
+    ? selectAssets(result.assets, flag(args, 'select')!)
+    : await promptSelection(result);
+  if (!selected.length) throw new Error('tidak ada aset dipilih');
+
+  const routers = getRoutersForChain(result.chain.key);
+  if (!routers.length) throw new Error(`belum ada router DEX V2 terdaftar untuk ${result.chain.key}`);
+
+  ui.info(`Tokens: ${selected.map((a) => color.yellow(a.symbol)).join(', ')}`);
+  ui.info(`Routers: ${routers.map((r) => `${color.cyan(r.name)} (${shortAddress(r.address)})`).join(', ')}`);
+
+  const rpc = rpcUrl(result.chain);
+  const registeredArb = record.arbExecutor ? (getAddress(record.arbExecutor) as Address) : undefined;
+  const useExisting = !hasFlag(args, 'redeploy') && (await executorExists(result.chain, rpc, registeredArb));
+  const action = useExisting
+    ? `sync allowlist arbExecutor ${registeredArb}`
+    : 'deploy MorphoAtomicArbPOC baru';
+
+  const broadcast =
+    hasFlag(args, 'broadcast') || (!hasFlag(args, 'plan') && (await askYesNo(`Broadcast ${action}?`)));
+  if (!broadcast) {
+    ui.plan(`${action}. Tambahkan --broadcast untuk transaksi on-chain.`);
+    return;
+  }
+  await confirmBroadcast(`${action} di ${result.chain.name}.`, hasFlag(args, 'yes'));
+
+  const chainConfig = viemChain(result.chain, rpc);
+  const account = privateKeyToAccount(privateKey());
+  const publicClient = createPublicClient({
+    chain: chainConfig,
+    transport: readTransport(result.chain, rpc),
+  });
+  const walletClient = createWalletClient({ account, chain: chainConfig, transport: http(rpc) });
+
+  const arbAbi = parseAbi([
+    'function owner() view returns (address)',
+    'function allowedToken(address) view returns (bool)',
+    'function allowedRouter(address) view returns (bool)',
+    'function setTokenAllowed(address,bool)',
+    'function setRouterAllowed(address,bool)',
+  ]);
+
+  if (useExisting && registeredArb) {
+    const owner = await publicClient.readContract({
+      address: registeredArb,
+      abi: arbAbi,
+      functionName: 'owner',
+    });
+    if (owner.toLowerCase() !== account.address.toLowerCase()) {
+      throw new Error(`wallet bukan owner arbExecutor (${owner})`);
+    }
+    for (const asset of selected) {
+      const allowed = await publicClient.readContract({
+        address: registeredArb,
+        abi: arbAbi,
+        functionName: 'allowedToken',
+        args: [asset.address],
+      });
+      if (allowed) continue;
+      const hash = await walletClient.writeContract({
+        address: registeredArb,
+        abi: arbAbi,
+        functionName: 'setTokenAllowed',
+        args: [asset.address, true],
+      });
+      await publicClient.waitForTransactionReceipt({ hash });
+      ui.success(`Arb Allowlisted Token ${color.yellow(asset.symbol)}  ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
+    }
+    for (const router of routers) {
+      const allowed = await publicClient.readContract({
+        address: registeredArb,
+        abi: arbAbi,
+        functionName: 'allowedRouter',
+        args: [router.address],
+      });
+      if (allowed) continue;
+      const hash = await walletClient.writeContract({
+        address: registeredArb,
+        abi: arbAbi,
+        functionName: 'setRouterAllowed',
+        args: [router.address, true],
+      });
+      await publicClient.waitForTransactionReceipt({ hash });
+      ui.success(`Arb Allowlisted Router ${color.cyan(router.name)}  ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
+    }
+    record.allowedRouters = routers.map((r) => r.address);
+    registry[result.chain.key] = record;
+    await saveDeployments(registry);
+    return;
+  }
+
+  let artifactRaw: string;
+  try {
+    artifactRaw = await readFile(arbArtifactPath, 'utf8');
+  } catch {
+    ui.info('Mengompilasi kontrak Solidity dengan solc...');
+    await compileContracts();
+    artifactRaw = await readFile(arbArtifactPath, 'utf8');
+  }
+  const artifact = JSON.parse(artifactRaw) as {
+    abi: Abi;
+    bytecode: { object: Hex };
+  };
+  if (!artifact.bytecode.object || artifact.bytecode.object === '0x') {
+    throw new Error('artifact MorphoAtomicArbPOC kosong; jalankan npm run compile:contracts');
+  }
+  const hash = await walletClient.deployContract({
+    abi: artifact.abi,
+    bytecode: artifact.bytecode.object,
+    args: [result.morpho, selected.map((a) => a.address), routers.map((r) => r.address)],
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success' || !receipt.contractAddress) {
+    throw new Error(`deployment MorphoAtomicArbPOC gagal: ${hash}`);
+  }
+  record.arbExecutor = getAddress(receipt.contractAddress) as Address;
+  record.allowedRouters = routers.map((r) => r.address);
+  registry[result.chain.key] = record;
+  await saveDeployments(registry);
+  ui.success(`ArbExecutor: ${color.cyan(record.arbExecutor)}`);
+  ui.success(`Deployment: ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
+}
+
+async function arbScan(args: ParsedArgs): Promise<void> {
+  const { result, record } = await runScan(args);
+  const report = await scanChainOpportunities({
+    chain: result.chain,
+    rpcUrl: rpcUrl(result.chain),
+    assets: result.assets,
+    flashExecutor: record.executor ? (getAddress(record.executor) as Address) : undefined,
+    arbExecutor: record.arbExecutor ? (getAddress(record.arbExecutor) as Address) : undefined,
+    arbLoanUsd: numberFlag(args, 'loan-usd', 10_000),
+    minProfitUsd: numberFlag(args, 'min-profit-usd', 5),
+    maxSlippageBps: numberFlag(args, 'max-slippage-bps', 30),
+  });
+
+  if (hasFlag(args, 'json')) {
+    console.log(JSON.stringify(report, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
+    return;
+  }
+
+  ui.section(`${result.chain.name.toUpperCase()} / WHITELIST & DEX ARBITRAGE SCAN`);
+  console.log(
+    `${color.dim('Block')} ${color.white(report.blockNumber)}  ` +
+      `${color.dim('Gas')} ${color.yellow(`${Number(report.gasPriceGwei).toFixed(3)} gwei`)}  ` +
+      `${color.dim('Whitelisted')} ${color.green(report.whitelistedAssets.length)}  ` +
+      `${color.dim('Pending Whitelist')} ${color.yellow(report.pendingWhitelistAssets.length)}`,
+  );
+
+  if (report.arbitrageCandidates.length) {
+    console.log(
+      renderTable(
+        [
+          { title: 'ROUTE' },
+          { title: 'DEX A -> DEX B' },
+          { title: 'LOAN USD', align: 'right' },
+          { title: 'SPREAD', align: 'right' },
+          { title: 'GAS USD', align: 'right' },
+          { title: 'NET PROFIT', align: 'right' },
+          { title: 'STATUS' },
+        ],
+        report.arbitrageCandidates.slice(0, 15).map((cand) => [
+          color.yellow(`${cand.loanSymbol}->${cand.intermediateSymbol}`),
+          color.cyan(`${cand.firstRouterName} -> ${cand.secondRouterName}`),
+          color.white(`$${Math.round(cand.loanAmountUsd).toLocaleString('en-US')}`),
+          cand.spreadBps >= 0
+            ? color.green(`+${cand.spreadBps} bps`)
+            : color.dim(`${cand.spreadBps} bps`),
+          color.dim(`$${cand.estimatedGasCostUsd.toFixed(4)}`),
+          cand.profitable
+            ? color.bold(color.green(`+$${cand.netProfitUsd.toFixed(2)}`))
+            : color.dim(`$${cand.netProfitUsd.toFixed(2)}`),
+          cand.profitable ? color.green('PROFITABLE') : color.dim('BELOW MIN'),
+        ]),
+      ),
+    );
+  } else {
+    ui.warning('Tidak ada pasangan rute DEX V2 yang ditemukan pada chain ini.');
+  }
+}
+
 async function interactiveMenu(args: ParsedArgs): Promise<void> {
   console.log(renderBanner());
   console.log(centerBlock(color.bold(color.cyan('MAIN MENU'))));
@@ -619,6 +819,8 @@ async function interactiveMenu(args: ParsedArgs): Promise<void> {
       [color.magenta('1'), color.white('LIQUIDITY SCAN'), color.dim('Find borrowable assets')],
       [color.magenta('2'), color.white('EXECUTOR SETUP'), color.dim('Deploy or sync allowlist')],
       [color.magenta('3'), color.green('RUN FLASHLOAN'), color.dim('Borrow and repay in one tx')],
+      [color.magenta('4'), color.cyan('LLM WATCH OPERATOR'), color.dim('VPS daemon: watch whitelist & profit')],
+      [color.magenta('5'), color.yellow('ARB EXECUTOR SETUP'), color.dim('Deploy or sync MorphoAtomicArbPOC')],
       [color.dim('0'), color.dim('EXIT'), color.dim('Close toolkit')],
     ],
   )));
@@ -626,12 +828,12 @@ async function interactiveMenu(args: ParsedArgs): Promise<void> {
   const readline = createInterface({ input, output });
   let answer: string;
   try {
-    answer = (await readline.question(centerBlock(promptText('Pilih menu', '[0-3]')))).trim();
+    answer = (await readline.question(centerBlock(promptText('Pilih menu', '[0-5]')))).trim();
   } finally {
     readline.close();
   }
   if (answer === '0') return;
-  if (!['1', '2', '3'].includes(answer)) throw new Error(`menu tidak valid: ${answer}`);
+  if (!['1', '2', '3', '4', '5'].includes(answer)) throw new Error(`menu tidak valid: ${answer}`);
   const chain = await promptChain(answer === '3');
   const chainArgs = withFlag(withFlag(args, 'chain', chain.key), 'compact-ui', 'true');
   if (answer === '1') {
@@ -639,8 +841,12 @@ async function interactiveMenu(args: ParsedArgs): Promise<void> {
     printScan(result, true);
   } else if (answer === '2') {
     await setup(chainArgs);
-  } else {
+  } else if (answer === '3') {
     await runFlashLoan(chainArgs);
+  } else if (answer === '4') {
+    await runWatchDaemon({ chains: [chain.key] });
+  } else {
+    await setupArb(chainArgs);
   }
 }
 
@@ -713,20 +919,31 @@ Usage:
   npm run cli -- chains
   npm run cli -- scan  --chain ethereum [--min-usd 100000] [--token 0x...]
   npm run cli -- scan-all [--chains ethereum,base,arbitrum] [--min-usd 100000]
+  npm run cli -- arb-scan --chain base [--loan-usd 10000] [--min-profit-usd 5]
   npm run cli -- setup --chain ethereum [--min-usd 100000] [--select all|1,2|USDC,WETH]
+  npm run cli -- setup-arb --chain base [--select USDC,WETH] [--broadcast]
   npm run cli -- flashloan --chain ethereum --asset WETH --amount 10 [--broadcast]
   npm run cli -- flashloan --chain ethereum --asset WETH --amount '$100000' [--broadcast]
+  npm run cli -- watch [--chains base,arbitrum,ethereum] [--mode full|arbitrage|whitelist-only|flashloan|dry-run] [--interval 30] [--broadcast]
 
 State-changing flags:
-  --broadcast   kirim deployment atau transaksi allowlist
+  --broadcast   kirim deployment, allowlist, atau eksekusi transaksi on-chain
   --yes         lewati prompt konfirmasi (untuk automation)
   --redeploy    deploy executor baru walaupun executor registry masih aktif
+
+VPS / LLM Operator flags:
+  --mode        dry-run | whitelist-only | flashloan | arbitrage | full
+  --interval    interval siklus watch dalam detik (default: 30)
+  --loan-usd    target nominal flashloan USD untuk kalkulasi arbitrase (default: 10000)
+  --min-profit-usd  batas profit bersih minimum USD setelah gas (default: 5)
+  --http-port   port HTTP dashboard & health check VPS (default: 3000, 0=nonaktif)
+  --once        jalankan tepat satu siklus watch lalu keluar
 
 Output flags:
   --json
   --max-price-age-hours 24
 
-Default setup adalah plan-only dan tidak mengirim transaksi.`);
+Default setup dan watch adalah plan/simulasi (dry-run) kecuali --broadcast atau AUTO_BROADCAST=true diaktifkan.`);
 }
 
 async function main(): Promise<void> {
@@ -747,12 +964,35 @@ async function main(): Promise<void> {
     case 'scan-all':
       await scanAll(args);
       break;
+    case 'arb-scan':
+      await arbScan(args);
+      break;
     case 'setup':
       await setup(args);
+      break;
+    case 'setup-arb':
+      await setupArb(args);
       break;
     case 'flashloan':
       await runFlashLoan(args);
       break;
+    case 'watch':
+    case 'agent': {
+      const chainsArg = flag(args, 'chains') ?? flag(args, 'chain');
+      await runWatchDaemon({
+        chains: chainsArg ? chainsArg.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+        intervalSec: flag(args, 'interval') ? numberFlag(args, 'interval', 30) : undefined,
+        minimumUsd: flag(args, 'min-usd') ? numberFlag(args, 'min-usd', 100_000) : undefined,
+        arbLoanUsd: flag(args, 'loan-usd') ? numberFlag(args, 'loan-usd', 10_000) : undefined,
+        minProfitUsd: flag(args, 'min-profit-usd') ? numberFlag(args, 'min-profit-usd', 5) : undefined,
+        mode: flag(args, 'mode') as OperatorMode | undefined,
+        autoBroadcast: args.flags.has('broadcast') ? hasFlag(args, 'broadcast') : undefined,
+        httpPort: flag(args, 'http-port') !== undefined ? numberFlag(args, 'http-port', 3000) : undefined,
+        once: hasFlag(args, 'once'),
+        json: hasFlag(args, 'json'),
+      });
+      break;
+    }
     case 'menu':
       await interactiveMenu(args);
       break;
