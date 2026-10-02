@@ -8,9 +8,12 @@ export type DeploymentRecord = {
   rpcEnv: string;
   morpho?: Address | '';
   executor?: Address | '';
+  arbExecutor?: Address | '';
   status?: string;
   allowedAssets?: string[];
+  allowedRouters?: string[];
   allowlistTransactions?: Record<string, string>;
+  arbLiveTests?: Array<Record<string, unknown>>;
   [key: string]: unknown;
 };
 
@@ -21,6 +24,9 @@ export const deploymentsPath = fileURLToPath(new URL('../../../evm/deployments.j
 export const stablecoinsPath = fileURLToPath(new URL('../../../evm/stablecoins.json', import.meta.url));
 export const artifactPath = fileURLToPath(
   new URL('../../../evm/out/FlashLoanExecutor.sol/FlashLoanExecutor.json', import.meta.url),
+);
+export const arbArtifactPath = fileURLToPath(
+  new URL('../../../evm/out/MorphoAtomicArbPOC.sol/MorphoAtomicArbPOC.json', import.meta.url),
 );
 
 export async function loadDeployments(): Promise<DeploymentRegistry> {

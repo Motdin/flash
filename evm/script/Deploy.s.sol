@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {FlashLoanExecutor} from "../src/FlashLoanExecutor.sol";
+import {MorphoAtomicArbPOC} from "../src/poc/MorphoAtomicArbPOC.sol";
 
 interface Vm {
     function envAddress(string calldata) external returns (address);
@@ -45,3 +46,29 @@ contract Deploy {
         vm.stopBroadcast();
     }
 }
+
+/// Deploy MorphoAtomicArbPOC with initial token and V2 router allowlists.
+/// Required env: MORPHO_ADDRESS, TOKEN_ADDRESSES, ROUTER_ADDRESSES, PRIVATE_KEY.
+contract DeployArb {
+    Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function run() external returns (MorphoAtomicArbPOC arbExecutor) {
+        address morpho = vm.envAddress("MORPHO_ADDRESS");
+        uint256 key = vm.envUint("PRIVATE_KEY");
+        require(morpho != address(0), "missing provider");
+        address[] memory tokens = vm.envAddress("TOKEN_ADDRESSES", ",");
+        address[] memory routers = vm.envAddress("ROUTER_ADDRESSES", ",");
+        require(tokens.length >= 2, "need at least 2 tokens");
+        require(routers.length >= 2, "need at least 2 routers");
+        vm.startBroadcast(key);
+        arbExecutor = new MorphoAtomicArbPOC(morpho, tokens, routers);
+        if (vm.envExists("OPERATOR_ADDRESS")) {
+            address op = vm.envAddress("OPERATOR_ADDRESS");
+            if (op != address(0)) {
+                arbExecutor.setOperator(op);
+            }
+        }
+        vm.stopBroadcast();
+    }
+}
+

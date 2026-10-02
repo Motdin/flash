@@ -153,6 +153,64 @@ contract MorphoAtomicArbPOCTest {
         require(!ok, "fake callback accepted");
     }
 
+    function testOwnerCanDelegateOperator() external {
+        (,,,,, MorphoAtomicArbPOC poc) = _deployProfitableRoute();
+        address vpsOperator = address(0xCAFE);
+        poc.setOperator(vpsOperator);
+        require(poc.operator() == vpsOperator, "operator not updated");
+    }
+
+    function testMultiHopArbitrageAndPreApprovals() external {
+        (
+            POCMockToken loanToken,
+            POCMockToken intermediateToken,
+            POCMockMorpho morpho,
+            POCMockV2Router firstRouter,
+            POCMockV2Router secondRouter,
+            MorphoAtomicArbPOC poc
+        ) = _deployProfitableRoute();
+
+        poc.setRouterPreApproval(address(loanToken), address(firstRouter), type(uint256).max);
+        poc.setRouterPreApproval(address(intermediateToken), address(secondRouter), type(uint256).max);
+        poc.setRouterPreApproval(address(loanToken), address(morpho), type(uint256).max);
+
+        MorphoAtomicArbPOC.MultiHopStep[] memory steps = new MorphoAtomicArbPOC.MultiHopStep[](2);
+        steps[0] = MorphoAtomicArbPOC.MultiHopStep({
+            hop: MorphoAtomicArbPOC.SwapHop({
+                router: address(firstRouter),
+                kind: MorphoAtomicArbPOC.RouterKind.V2,
+                fee: 0,
+                stable: false,
+                factory: address(0)
+            }),
+            tokenOut: address(intermediateToken),
+            minAmountOut: 1_900 * UNIT
+        });
+        steps[1] = MorphoAtomicArbPOC.MultiHopStep({
+            hop: MorphoAtomicArbPOC.SwapHop({
+                router: address(secondRouter),
+                kind: MorphoAtomicArbPOC.RouterKind.V2,
+                fee: 0,
+                stable: false,
+                factory: address(0)
+            }),
+            tokenOut: address(loanToken),
+            minAmountOut: 1_050 * UNIT
+        });
+
+        uint256 profit = poc.executeMultiHopArbitrage(
+            MorphoAtomicArbPOC.MultiHopArbitrageParams({
+                loanToken: address(loanToken),
+                loanAmount: 1_000 * UNIT,
+                steps: steps,
+                minProfit: 50 * UNIT,
+                deadline: type(uint256).max,
+                profitReceiver: PROFIT_RECEIVER
+            })
+        );
+        require(profit == 100 * UNIT, "wrong multihop profit");
+    }
+
     function _deployProfitableRoute()
         private
         returns (

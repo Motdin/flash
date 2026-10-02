@@ -1,0 +1,31 @@
+# Systemd Service Unit for Morpho LLM Watch Operator & Executor
+# Copy to /etc/systemd/system/morpho-llm-operator.service
+# Then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now morpho-llm-operator
+#   sudo journalctl -u morpho-llm-operator -f
+
+[Unit]
+Description=Morpho Multichain LLM Watch Operator & Executor Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/flash/tools
+EnvironmentFile=/opt/flash/tools/.env
+ExecStart=/usr/bin/npm run watch
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morpho-llm-operator
+
+# Security hardening for VPS
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

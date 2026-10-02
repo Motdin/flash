@@ -1,0 +1,8 @@
+node_modules
+tools/node_modules
+tools/dist
+tools/logs
+tools/.env
+evm/cache
+evm/broadcast
+.git
