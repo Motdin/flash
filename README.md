@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/evm-loan-toolkit-banner.png" alt="EVM Loan Toolkit banner" width="100%" />
-</p>
+
 
 # ⚡ EVM-LOAN-TOOLKIT — Morpho Blue Multichain Flashloan, Multi-DEX Arbitrage & Autonomous LLM Operator
 
