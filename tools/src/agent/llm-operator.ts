@@ -200,6 +200,21 @@ export function loadLlmOperatorConfig(overrides?: Partial<LlmOperatorConfig>): L
   };
 }
 
+/**
+ * Whether the operator has explicitly opted into flashloan execution.
+ *
+ * Flashloans move no arbitrage profit on their own: they exist to exercise the
+ * `FlashLoanExecutor` contract. Enabling them requires either `FLASHLOAN_ON_WHITELIST=true`
+ * or `OPERATOR_MODE=flashloan`; `mode='full'` alone must NOT be enough, otherwise a model
+ * that ignores the system prompt could trigger a flashloan the operator never enabled.
+ */
+export function isFlashloanExecutionRequested(
+  mode: OperatorMode,
+  flashloanOnWhitelist: boolean,
+): boolean {
+  return flashloanOnWhitelist || mode === 'flashloan';
+}
+
 export function isActionAllowedByMode(action: OperatorActionType, mode: OperatorMode): boolean {
   if (action === 'HOLD') return true;
   if (mode === 'dry-run' || mode === 'full') return true;
@@ -480,7 +495,7 @@ export function evaluateDeterministically(
   );
 
   if (
-    (config.flashloanOnWhitelist || config.mode === 'flashloan') &&
+    isFlashloanExecutionRequested(config.mode, config.flashloanOnWhitelist) &&
     readyWhitelistedAsset &&
     report.flashExecutor &&
     !report.flashExecutorPaused &&
@@ -846,6 +861,28 @@ Format output WAJIB JSON object tanpa markdown tambahan:
         };
       }
 
+      // Policy Guard: `WHITELIST_AUTO_SYNC=false` must be enforced here too. The system prompt
+      // only *asks* the model to consider this flag, so without a hard check a model that
+      // ignores it could broadcast allowlist transactions the operator explicitly disabled.
+      if (!config.whitelistAutoSync) {
+        return {
+          action: 'HOLD',
+          confidence,
+          reasoning: `[Policy Guard] LLM memilih SYNC_WHITELIST namun WHITELIST_AUTO_SYNC=false. Whitelist harus disinkronkan manual (npm run cli -- setup-arb --select all --broadcast). Catatan LLM: ${reasoning}`,
+          chain: report.chain.key,
+          blockNumber: report.blockNumber.toString(),
+          riskAssessment: {
+            level: 'MEDIUM',
+            checksPassed,
+            warnings: [...warnings, 'whitelistAutoSync disabled by operator'],
+          },
+          source: 'llm',
+          model: config.model,
+          latencyMs: Date.now() - startTime,
+          timestamp: new Date().toISOString(),
+        };
+      }
+
       return {
         action: 'SYNC_WHITELIST',
         confidence,
@@ -862,6 +899,29 @@ Format output WAJIB JSON object tanpa markdown tambahan:
     }
 
     if (rawAction === 'EXECUTE_FLASHLOAN') {
+      // Policy Guard: mirror the deterministic engine's opt-in requirement. Without this,
+      // `mode='full'` alone would let a model that ignores the system prompt trigger a
+      // flashloan the operator never enabled — which reverts whenever the executing wallet is
+      // not the FlashLoanExecutor owner, failing the cycle on every iteration.
+      if (!isFlashloanExecutionRequested(config.mode, config.flashloanOnWhitelist)) {
+        return {
+          action: 'HOLD',
+          confidence,
+          reasoning: `[Policy Guard] LLM memilih EXECUTE_FLASHLOAN namun flashloan tidak diaktifkan operator (FLASHLOAN_ON_WHITELIST=false dan mode bukan 'flashloan'). Catatan LLM: ${reasoning}`,
+          chain: report.chain.key,
+          blockNumber: report.blockNumber.toString(),
+          riskAssessment: {
+            level: 'MEDIUM',
+            checksPassed,
+            warnings: [...warnings, 'flashloan execution not enabled by operator'],
+          },
+          source: 'llm',
+          model: config.model,
+          latencyMs: Date.now() - startTime,
+          timestamp: new Date().toISOString(),
+        };
+      }
+
       const requestedSymbol = parsed.flashloanSymbol ? String(parsed.flashloanSymbol).toUpperCase() : undefined;
       const asset =
         report.whitelistedAssets.find(

@@ -7,6 +7,7 @@ import {
   evaluateDeterministically,
   evaluateWithLlmOperator,
   isActionAllowedByMode,
+  isFlashloanExecutionRequested,
   loadLlmOperatorConfig,
 } from './llm-operator.js';
 
@@ -141,6 +142,134 @@ test('evaluateDeterministically selects SYNC_WHITELIST when pending whitelist to
   assert.equal(decision.action, 'SYNC_WHITELIST');
   assert.equal(decision.whitelistPlan?.tokensToAllow.length, 1);
   assert.equal(decision.whitelistPlan?.tokensToAllow[0].symbol, 'cbBTC');
+});
+
+const pendingWhitelistAsset = {
+  symbol: 'cbBTC',
+  address: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' as const,
+  decimals: 8,
+  usdValue: 500_000,
+  priceUsd: 65_000,
+  balance: 1_000_000_000n,
+  formattedBalance: '10',
+  allowedOnFlashExecutor: false,
+  allowedOnArbExecutor: false,
+  matchesPolicyTarget: true,
+  needsFlashWhitelist: true,
+  needsArbWhitelist: false,
+};
+
+function stubLlmResponse(payload: Record<string, unknown>): () => void {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: JSON.stringify(payload) } }],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as typeof fetch;
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
+
+test('Policy Guard overrides an LLM SYNC_WHITELIST choice when WHITELIST_AUTO_SYNC=false', async () => {
+  const report = createMockReport({ pendingWhitelistAssets: [pendingWhitelistAsset] });
+  const config = loadLlmOperatorConfig({
+    mode: 'full',
+    whitelistAutoSync: false,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+    apiKey: undefined,
+  });
+
+  const restoreFetch = stubLlmResponse({
+    action: 'SYNC_WHITELIST',
+    confidence: 0.95,
+    reasoning: 'Sinkronkan allowlist sekarang',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config);
+    assert.equal(decision.action, 'HOLD', 'operator-disabled allowlist sync must never broadcast');
+    assert.match(decision.reasoning, /Policy Guard/);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('LLM SYNC_WHITELIST is honoured when WHITELIST_AUTO_SYNC=true', async () => {
+  const report = createMockReport({ pendingWhitelistAssets: [pendingWhitelistAsset] });
+  const config = loadLlmOperatorConfig({
+    mode: 'full',
+    whitelistAutoSync: true,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+    apiKey: undefined,
+  });
+
+  const restoreFetch = stubLlmResponse({
+    action: 'SYNC_WHITELIST',
+    confidence: 0.95,
+    reasoning: 'Sinkronkan allowlist sekarang',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config);
+    assert.equal(decision.action, 'SYNC_WHITELIST');
+    assert.equal(decision.whitelistPlan?.tokensToAllow[0]?.symbol, 'cbBTC');
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('isFlashloanExecutionRequested requires an explicit opt-in, not just mode=full', () => {
+  assert.equal(isFlashloanExecutionRequested('full', false), false, 'mode=full alone must not enable flashloans');
+  assert.equal(isFlashloanExecutionRequested('full', true), true);
+  assert.equal(isFlashloanExecutionRequested('flashloan', false), true);
+  assert.equal(isFlashloanExecutionRequested('arbitrage', false), false);
+  assert.equal(isFlashloanExecutionRequested('liquidation', true), true);
+});
+
+test('Policy Guard overrides an LLM EXECUTE_FLASHLOAN choice when flashloans are not enabled', async () => {
+  const flashAsset = {
+    symbol: 'USDC',
+    address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const,
+    decimals: 6,
+    usdValue: 250_000,
+    priceUsd: 1,
+    balance: 250_000_000_000n,
+    formattedBalance: '250000',
+    allowedOnFlashExecutor: true,
+    allowedOnArbExecutor: true,
+    matchesPolicyTarget: true,
+    needsFlashWhitelist: false,
+    needsArbWhitelist: false,
+  };
+  const report = createMockReport({ whitelistedAssets: [flashAsset] });
+  const config = loadLlmOperatorConfig({
+    mode: 'full',
+    flashloanOnWhitelist: false,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+    apiKey: undefined,
+  });
+
+  const restoreFetch = stubLlmResponse({
+    action: 'EXECUTE_FLASHLOAN',
+    confidence: 0.9,
+    reasoning: 'Pinjam USDC untuk menguji eksekutor',
+    flashloanSymbol: 'USDC',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config);
+    assert.equal(decision.action, 'HOLD', 'flashloans disabled by operator must never broadcast');
+    assert.match(decision.reasoning, /Policy Guard/);
+    assert.equal(decision.flashloanPlan, undefined);
+  } finally {
+    restoreFetch();
+  }
 });
 
 test('computeDynamicPriorityFee allocates profit bribe while respecting cap', () => {

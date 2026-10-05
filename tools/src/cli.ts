@@ -21,6 +21,12 @@ import { getRoutersForChain } from './config/dex-routers.js';
 import { loadToolEnv } from './config/env.js';
 import type { OperatorMode } from './agent/llm-operator.js';
 import { runWatchDaemon } from './agent/watcher.js';
+import {
+  allowlistBatch,
+  scaleFeeForAttempt,
+  summarizeAllowlistOutcomes,
+  type AllowlistTarget,
+} from './commands/allowlist.js';
 import { compileContracts } from './commands/compile-contracts.js';
 import { scanChainOpportunities } from './morpho/dex-scanner.js';
 import { scanMorphoBalances, type ScanResult, type ScannedAsset } from './morpho/scanner.js';
@@ -406,6 +412,39 @@ async function deployExecutor(
   };
 }
 
+/**
+ * Builds a fee escalator for allowlist retries.
+ *
+ * The default nonce resolution uses the `latest` block tag, so when a transaction for the next
+ * nonce is already queued the node answers "replacement transaction underpriced" unless the
+ * resend is meaningfully more expensive. Attempt #1 uses the untouched estimate; every retry
+ * scales the fee up via `scaleFeeForAttempt` so the queued transaction can be displaced.
+ */
+function makeFeeEscalator(
+  publicClient: ReturnType<typeof createPublicClient>,
+): (attempt: number) => Promise<{ maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint }> {
+  return async (attempt: number) => {
+    if (attempt <= 1) return {};
+    try {
+      const estimate = await publicClient.estimateFeesPerGas();
+      const maxFeePerGas =
+        estimate.maxFeePerGas !== undefined
+          ? scaleFeeForAttempt(estimate.maxFeePerGas, attempt)
+          : undefined;
+      const maxPriorityFeePerGas =
+        estimate.maxPriorityFeePerGas !== undefined
+          ? scaleFeeForAttempt(estimate.maxPriorityFeePerGas, attempt)
+          : undefined;
+      return {
+        ...(maxFeePerGas !== undefined ? { maxFeePerGas } : {}),
+        ...(maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas } : {}),
+      };
+    } catch {
+      return {};
+    }
+  };
+}
+
 async function syncAllowlist(
   chain: EvmChainConfig,
   rpc: string,
@@ -425,18 +464,57 @@ async function syncAllowlist(
   if (configuredMorpho.toLowerCase() !== morpho.toLowerCase()) throw new Error('Morpho executor tidak cocok dengan registry');
 
   const transactions: Record<string, string> = {};
-  for (const asset of selected) {
-    const allowed = await publicClient.readContract({
-      address: executor, abi: executorAbi, functionName: 'allowedToken', args: [asset.address],
-    });
-    if (allowed) continue;
-    const hash = await walletClient.writeContract({
-      address: executor, abi: executorAbi, functionName: 'setTokenAllowed', args: [asset.address, true],
-    });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    if (receipt.status !== 'success') throw new Error(`allowlist gagal ${asset.symbol}: ${hash}`);
-    transactions[`${asset.symbol}:${asset.address}`] = hash;
-    ui.success(`Allowlisted ${color.yellow(asset.symbol)}  ${color.cyan(`${chain.explorer}/tx/${hash}`)}`);
+  const escalatedFees = makeFeeEscalator(publicClient);
+  const targets: AllowlistTarget[] = selected.map((asset) => ({
+    label: asset.symbol,
+    address: asset.address,
+    isAllowed: async () =>
+      Boolean(
+        await publicClient.readContract({
+          address: executor,
+          abi: executorAbi,
+          functionName: 'allowedToken',
+          args: [asset.address],
+        }),
+      ),
+    send: async (attempt: number) =>
+      walletClient.writeContract({
+        address: executor,
+        abi: executorAbi,
+        functionName: 'setTokenAllowed',
+        args: [asset.address, true],
+        ...(await escalatedFees(attempt)),
+      }),
+    confirm: async (hash) => {
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: hash as Hash });
+      if (receipt.status !== 'success') {
+        throw new Error(`allowlist gagal ${asset.symbol}: ${hash}`);
+      }
+    },
+    onRetry: (attempt, error) => {
+      const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+      ui.warning(`Nonce race pada ${asset.symbol} (${reason}) — percobaan ulang #${attempt}...`);
+    },
+  }));
+
+  const { outcomes, summary } = await allowlistBatch(targets, {
+    onOutcome: (outcome) => {
+      if (outcome.status === 'allowlisted' && outcome.hash) {
+        transactions[`${outcome.label}:${outcome.address}`] = outcome.hash;
+        ui.success(
+          `Allowlisted ${color.yellow(outcome.label)}  ${color.cyan(`${chain.explorer}/tx/${outcome.hash}`)}`,
+        );
+      } else if (outcome.status === 'already-allowed') {
+        ui.info(`Aset ${color.yellow(outcome.label)} sudah ter-allowlist`);
+      }
+    },
+  });
+
+  if (summary.failed > 0) {
+    const names = summary.failures.map((f) => f.label).join(', ');
+    throw new Error(
+      `${summary.failed} aset gagal di-allowlist: ${names}. Jalankan ulang perintah yang sama untuk melanjutkan.`,
+    );
   }
   return transactions;
 }
@@ -680,43 +758,110 @@ async function setupArb(args: ParsedArgs): Promise<void> {
     if (owner.toLowerCase() !== account.address.toLowerCase()) {
       throw new Error(`wallet bukan owner arbExecutor (${owner})`);
     }
-    for (const asset of selected) {
-      const allowed = await publicClient.readContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'allowedToken',
-        args: [asset.address],
+    const escalatedFees = makeFeeEscalator(publicClient);
+    // Allowlist one target at a time through a nonce-race resilient batch: a transient
+    // "nonce too low" from a lagging public RPC is retried after re-reading on-chain state,
+    // a single failure no longer aborts the remaining targets, and retries escalate the fee
+    // so a queued same-nonce transaction can be displaced instead of rejected as underpriced.
+
+    const tokenTargets: AllowlistTarget[] = selected.map((asset) => ({
+      label: asset.symbol,
+      address: asset.address,
+      isAllowed: async () =>
+        Boolean(
+          await publicClient.readContract({
+            address: registeredArb,
+            abi: arbAbi,
+            functionName: 'allowedToken',
+            args: [asset.address],
+          }),
+        ),
+      send: async (attempt: number) =>
+        walletClient.writeContract({
+          address: registeredArb,
+          abi: arbAbi,
+          functionName: 'setTokenAllowed',
+          args: [asset.address, true],
+          ...(await escalatedFees(attempt)),
+        }),
+      confirm: async (hash) => {
+        const receipt = await publicClient.waitForTransactionReceipt({ hash: hash as Hash });
+        if (receipt.status !== 'success') {
+          throw new Error(`setTokenAllowed revert untuk ${asset.symbol}: ${hash}`);
+        }
+      },
+      onRetry: (attempt, error) => {
+        const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+        ui.warning(`Nonce race pada ${asset.symbol} (${reason}) — percobaan ulang #${attempt}...`);
+      },
+    }));
+
+    const routerTargets: AllowlistTarget[] = routers.map((router) => ({
+      label: router.name,
+      address: router.address,
+      isAllowed: async () =>
+        Boolean(
+          await publicClient.readContract({
+            address: registeredArb,
+            abi: arbAbi,
+            functionName: 'allowedRouter',
+            args: [router.address],
+          }),
+        ),
+      send: async (attempt: number) =>
+        walletClient.writeContract({
+          address: registeredArb,
+          abi: arbAbi,
+          functionName: 'setRouterAllowed',
+          args: [router.address, true],
+          ...(await escalatedFees(attempt)),
+        }),
+      confirm: async (hash) => {
+        const receipt = await publicClient.waitForTransactionReceipt({ hash: hash as Hash });
+        if (receipt.status !== 'success') {
+          throw new Error(`setRouterAllowed revert untuk ${router.name}: ${hash}`);
+        }
+      },
+      onRetry: (attempt, error) => {
+        const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+        ui.warning(`Nonce race pada ${router.name} (${reason}) — percobaan ulang #${attempt}...`);
+      },
+    }));
+
+    const runAllowlistBatch = async (
+      kind: 'Token' | 'Router',
+      targets: AllowlistTarget[],
+    ): Promise<ReturnType<typeof summarizeAllowlistOutcomes>> => {
+      const { summary } = await allowlistBatch(targets, {
+        onOutcome: (outcome) => {
+          if (outcome.status === 'allowlisted') {
+            const link = outcome.hash
+              ? `  ${color.cyan(`${result.chain.explorer}/tx/${outcome.hash}`)}`
+              : '';
+            ui.success(`Arb Allowlisted ${kind} ${color.yellow(outcome.label)}${link}`);
+          } else if (outcome.status === 'already-allowed') {
+            ui.info(`Arb ${kind} ${color.yellow(outcome.label)} sudah ter-whitelist`);
+          }
+        },
       });
-      if (allowed) continue;
-      const hash = await walletClient.writeContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'setTokenAllowed',
-        args: [asset.address, true],
-      });
-      await publicClient.waitForTransactionReceipt({ hash });
-      ui.success(`Arb Allowlisted Token ${color.yellow(asset.symbol)}  ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
-    }
-    for (const router of routers) {
-      const allowed = await publicClient.readContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'allowedRouter',
-        args: [router.address],
-      });
-      if (allowed) continue;
-      const hash = await walletClient.writeContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'setRouterAllowed',
-        args: [router.address, true],
-      });
-      await publicClient.waitForTransactionReceipt({ hash });
-      ui.success(`Arb Allowlisted Router ${color.cyan(router.name)}  ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
-    }
+      return summary;
+    };
+
+    const tokenSummary = await runAllowlistBatch('Token', tokenTargets);
+    const routerSummary = await runAllowlistBatch('Router', routerTargets);
+
     record.allowedRouters = routers.map((r) => r.address);
     registry[result.chain.key] = record;
     await saveDeployments(registry);
+
+    const failures = [...tokenSummary.failures, ...routerSummary.failures];
+    if (failures.length > 0) {
+      const names = failures.map((f) => f.label).join(', ');
+      throw new Error(
+        `${failures.length} target gagal di-allowlist (transaksi tidak terkirim, gas tidak terpakai): ${names}. ` +
+          'State yang berhasil sudah disimpan — jalankan ulang perintah yang sama untuk melanjutkan (target yang sudah ter-whitelist otomatis dilewati).',
+      );
+    }
     return;
   }
 
