@@ -33,6 +33,7 @@ On every watch cycle (`WATCH_INTERVAL_SEC`, default `30` seconds), the daemon ex
    - **Mandatory Simulation**: Every contract call (`setTokenAllowed`, `setRouterAllowed`, `flashLoan`, `executeArbitrage`, `executeMultiDexArbitrage`, `executeLiquidation`) must pass `publicClient.simulateContract(...)` on the latest block before signing.
    - **Dynamic Priority Fee (Bribe)**: Allocates `PROFIT_BRIBE_BPS` (default `1500` = 15% of surplus profit, capped at `MAX_PRIORITY_FEE_GWEI`) to EIP-1559 `maxPriorityFeePerGas` while preserving `minProfitUsd`.
    - **Private MEV Relay**: Routes live broadcasts through `PRIVATE_TX_RPC_URL` or `<CHAIN>_PRIVATE_RPC_URL` (e.g., Flashbots Protect / MEV Blocker) when configured.
+   - **Native Bundle Path (`MEV_BUNDLE_ENABLED=true`)**: Signs the multi-hop transaction once, submits it via `eth_sendBundle`, and — only when at least one relay accepts — watches that bundled hash for `MEV_BUNDLE_WAIT_BLOCKS` (default `4`) blocks instead of re-broadcasting it publicly. If no builder includes it, the cycle reports `[MEV BUNDLE MISS]` (0 gas, no circuit-breaker strike, cooldown released so the next scan re-quotes). Chains with no configured relay keep the previous broadcast path and say so in the summary.
    - **Circuit Breaker (`MAX_CONSECUTIVE_FAILURES=3`)**: Automatically disables `autoBroadcast` if 3 consecutive simulations or broadcasts fail.
 
 ---
@@ -111,6 +112,12 @@ npm run cli -- watch --chains base,arbitrum --mode full --once
 
 # Run standalone Multi-DEX arbitrage & whitelist scan
 npm run cli -- arb-scan --chain base --loan-usd 10000 --min-profit-usd 5
+
+# Run a standalone Morpho liquidation / pre-liquidation watchlist scan
+npm run cli -- liq-scan --chain base --max-hf 1.05
+
+# Read only the persisted watchlist (no RPC), e.g. from a cron job
+npm run cli -- liq-scan --at-risk --json
 ```
 
 ### Option C: PM2 Process Manager

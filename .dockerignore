@@ -5,4 +5,6 @@ tools/logs
 tools/.env
 evm/cache
 evm/broadcast
+# evm/out is compiled inside the image (see Dockerfile) so host artifacts never change the build result
+evm/out
 .git

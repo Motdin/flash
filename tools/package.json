@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "compile:contracts": "tsx src/commands/compile-contracts.ts",
-    "test": "tsx --test src/morpho/*.test.ts src/agent/*.test.ts",
+    "test": "tsx --test src/morpho/*.test.ts src/agent/*.test.ts src/commands/*.test.ts",
     "start": "tsx src/commands/status.ts",
     "cli": "tsx src/cli.ts",
     "watch": "tsx src/commands/watch.ts",

@@ -1,4 +1,4 @@
-import { keccak256, stringToHex, type Hex } from 'viem';
+import { keccak256, stringToHex, type Hash, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 export const DEFAULT_MAINNET_BUILDERS = [
@@ -187,4 +187,159 @@ export async function submitMevBundleToRelays(params: {
     bundleHashes,
     results,
   };
+}
+
+/**
+ * The hash of the transaction carried inside the bundle.
+ *
+ * A signed transaction's hash is, by definition, `keccak256` over its encoded bytes — for a
+ * typed (EIP-1559) transaction that encoding is `0x02 || rlp(...)`, which is exactly what
+ * `walletClient.signTransaction()` returns and what gets submitted to the relay. Watching this
+ * hash is therefore the only way to learn whether the *bundled* transaction landed, without
+ * re-broadcasting anything to the public mempool.
+ */
+export function bundleTxHash(signedRawTransaction: Hex): Hash {
+  return keccak256(signedRawTransaction);
+}
+
+/**
+ * Whether a bundle outcome is worth waiting on instead of falling back to a public broadcast.
+ *
+ * `relaysAttempted === 0` means the chain has no known builder relay (`resolveMevBundleRelays`),
+ * and `relaysAccepted === 0` means every relay rejected the submission; in both cases there is
+ * nothing to wait for and the caller must keep the previous public path.
+ */
+export function shouldWaitForBundle(params: {
+  bundleEnabled: boolean;
+  relaysAttempted: number;
+  relaysAccepted: number;
+}): boolean {
+  return params.bundleEnabled && params.relaysAccepted > 0;
+}
+
+export type BundleInclusionStatus = 'not-checked' | 'included-success' | 'included-reverted' | 'missed';
+
+export type BundleBroadcastAction = 'public-broadcast' | 'bundle-only' | 'abstain-zero-gas';
+
+export type BundleBroadcastDecision = {
+  action: BundleBroadcastAction;
+  /** Only a real on-chain revert may count as a failure; a missed bundle cost 0 gas. */
+  countAsFailure: boolean;
+  reason: string;
+};
+
+/**
+ * Single source of truth for what to do once a bundle has been submitted.
+ *
+ * The critical property is `abstain-zero-gas`: when the bundle was accepted by a relay but the
+ * builder did not include it, re-broadcasting the same transaction publicly is both a leak of
+ * the private route and a duplicate that can never be mined (its nonce was consumed only if the
+ * bundle landed). Treating that miss as a failure would also let the watcher's circuit breaker
+ * disable `autoBroadcast` after `MAX_CONSECUTIVE_FAILURES` *profitable* no-ops.
+ */
+export function resolveBundleBroadcastDecision(params: {
+  bundleEnabled: boolean;
+  relaysAttempted: number;
+  relaysAccepted: number;
+  inclusion: BundleInclusionStatus;
+}): BundleBroadcastDecision {
+  if (!params.bundleEnabled) {
+    return { action: 'public-broadcast', countAsFailure: false, reason: 'MEV bundle tidak aktif' };
+  }
+  if (params.relaysAttempted === 0) {
+    return {
+      action: 'public-broadcast',
+      countAsFailure: false,
+      reason: 'tidak ada builder relay untuk chain ini; private RPC tetap dipakai bila dikonfigurasi',
+    };
+  }
+  if (params.relaysAccepted === 0) {
+    return {
+      action: 'public-broadcast',
+      countAsFailure: false,
+      reason: 'semua relay menolak bundle, fallback ke broadcast publik',
+    };
+  }
+  switch (params.inclusion) {
+    case 'included-success':
+      return { action: 'bundle-only', countAsFailure: false, reason: 'bundle masuk blok target' };
+    case 'included-reverted':
+      return {
+        action: 'bundle-only',
+        countAsFailure: true,
+        reason: 'transaksi dalam bundle revert on-chain',
+      };
+    case 'missed':
+      return {
+        action: 'abstain-zero-gas',
+        countAsFailure: false,
+        reason: 'builder tidak memasukkan bundle ke blok target (0 gas terpakai)',
+      };
+    default:
+      return {
+        action: 'bundle-only',
+        countAsFailure: false,
+        reason: 'bundle diterima relay, status inklusi belum diperiksa',
+      };
+  }
+}
+
+export type BundleReceiptLite = {
+  blockNumber: bigint;
+  status: 'success' | 'reverted';
+};
+
+export type BundleInclusionResult =
+  | { status: 'included-success' | 'included-reverted'; receipt: BundleReceiptLite; polls: number }
+  | { status: 'missed'; lastSeenBlockNumber: bigint; polls: number };
+
+/**
+ * Waits for the bundled transaction to be mined, bounded by blocks rather than a fixed
+ * wall-clock timeout.
+ *
+ * `waitForTransactionReceipt()` would block for ~180s when the bundle misses, stalling the watch
+ * loop for minutes on a transaction that can no longer be mined. Here the deadline is
+ * `targetBlockNumber + maxBlocks`, so a miss is detected within a couple of block times. Every
+ * dependency is injected, which keeps this testable without a node and makes receipt-lookup
+ * errors (a lagging RPC replica) non-fatal: they simply cost one more poll.
+ */
+export async function awaitBundleInclusion(params: {
+  txHash: Hash;
+  targetBlockNumber: bigint;
+  maxBlocks?: number;
+  pollIntervalMs?: number;
+  getReceipt: (txHash: Hash) => Promise<BundleReceiptLite | null>;
+  getBlockNumber: () => Promise<bigint>;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<BundleInclusionResult> {
+  const maxBlocks = Math.max(1, Math.trunc(params.maxBlocks ?? 4));
+  const pollIntervalMs = params.pollIntervalMs ?? 1_000;
+  const sleep =
+    params.sleep ??
+    ((ms: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ms);
+      }));
+  const deadlineBlock = params.targetBlockNumber + BigInt(maxBlocks);
+  // Safety net so a node whose block number never advances cannot spin forever.
+  const maxPolls = maxBlocks * Math.max(1, Math.ceil(15_000 / pollIntervalMs));
+  let lastSeenBlockNumber = 0n;
+
+  for (let poll = 1; poll <= maxPolls; poll++) {
+    const receipt = await params.getReceipt(params.txHash).catch(() => null);
+    if (receipt) {
+      return {
+        status: receipt.status === 'success' ? 'included-success' : 'included-reverted',
+        receipt,
+        polls: poll,
+      };
+    }
+    lastSeenBlockNumber = await params.getBlockNumber().catch(() => lastSeenBlockNumber);
+    if (lastSeenBlockNumber >= deadlineBlock) {
+      return { status: 'missed', lastSeenBlockNumber, polls: poll };
+    }
+    if (poll < maxPolls) await sleep(pollIntervalMs);
+  }
+
+  return { status: 'missed', lastSeenBlockNumber, polls: maxPolls };
 }

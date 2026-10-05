@@ -21,8 +21,19 @@ import { getRoutersForChain } from './config/dex-routers.js';
 import { loadToolEnv } from './config/env.js';
 import type { OperatorMode } from './agent/llm-operator.js';
 import { runWatchDaemon } from './agent/watcher.js';
+import {
+  allowlistBatch,
+  scaleFeeForAttempt,
+  summarizeAllowlistOutcomes,
+  type AllowlistTarget,
+} from './commands/allowlist.js';
 import { compileContracts } from './commands/compile-contracts.js';
 import { scanChainOpportunities } from './morpho/dex-scanner.js';
+import {
+  getAtRiskWatchlist,
+  loadWatchlistFromDisk,
+  type MorphoBorrowerWatchlistEntry,
+} from './morpho/liquidation-scanner.js';
 import { scanMorphoBalances, type ScanResult, type ScannedAsset } from './morpho/scanner.js';
 import { centerBlock, color, joinBlocks, promptText, renderBanner, renderTable, terminalLink, ui } from './ui/index.js';
 import {
@@ -406,6 +417,39 @@ async function deployExecutor(
   };
 }
 
+/**
+ * Builds a fee escalator for allowlist retries.
+ *
+ * The default nonce resolution uses the `latest` block tag, so when a transaction for the next
+ * nonce is already queued the node answers "replacement transaction underpriced" unless the
+ * resend is meaningfully more expensive. Attempt #1 uses the untouched estimate; every retry
+ * scales the fee up via `scaleFeeForAttempt` so the queued transaction can be displaced.
+ */
+function makeFeeEscalator(
+  publicClient: ReturnType<typeof createPublicClient>,
+): (attempt: number) => Promise<{ maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint }> {
+  return async (attempt: number) => {
+    if (attempt <= 1) return {};
+    try {
+      const estimate = await publicClient.estimateFeesPerGas();
+      const maxFeePerGas =
+        estimate.maxFeePerGas !== undefined
+          ? scaleFeeForAttempt(estimate.maxFeePerGas, attempt)
+          : undefined;
+      const maxPriorityFeePerGas =
+        estimate.maxPriorityFeePerGas !== undefined
+          ? scaleFeeForAttempt(estimate.maxPriorityFeePerGas, attempt)
+          : undefined;
+      return {
+        ...(maxFeePerGas !== undefined ? { maxFeePerGas } : {}),
+        ...(maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas } : {}),
+      };
+    } catch {
+      return {};
+    }
+  };
+}
+
 async function syncAllowlist(
   chain: EvmChainConfig,
   rpc: string,
@@ -425,18 +469,57 @@ async function syncAllowlist(
   if (configuredMorpho.toLowerCase() !== morpho.toLowerCase()) throw new Error('Morpho executor tidak cocok dengan registry');
 
   const transactions: Record<string, string> = {};
-  for (const asset of selected) {
-    const allowed = await publicClient.readContract({
-      address: executor, abi: executorAbi, functionName: 'allowedToken', args: [asset.address],
-    });
-    if (allowed) continue;
-    const hash = await walletClient.writeContract({
-      address: executor, abi: executorAbi, functionName: 'setTokenAllowed', args: [asset.address, true],
-    });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    if (receipt.status !== 'success') throw new Error(`allowlist gagal ${asset.symbol}: ${hash}`);
-    transactions[`${asset.symbol}:${asset.address}`] = hash;
-    ui.success(`Allowlisted ${color.yellow(asset.symbol)}  ${color.cyan(`${chain.explorer}/tx/${hash}`)}`);
+  const escalatedFees = makeFeeEscalator(publicClient);
+  const targets: AllowlistTarget[] = selected.map((asset) => ({
+    label: asset.symbol,
+    address: asset.address,
+    isAllowed: async () =>
+      Boolean(
+        await publicClient.readContract({
+          address: executor,
+          abi: executorAbi,
+          functionName: 'allowedToken',
+          args: [asset.address],
+        }),
+      ),
+    send: async (attempt: number) =>
+      walletClient.writeContract({
+        address: executor,
+        abi: executorAbi,
+        functionName: 'setTokenAllowed',
+        args: [asset.address, true],
+        ...(await escalatedFees(attempt)),
+      }),
+    confirm: async (hash) => {
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: hash as Hash });
+      if (receipt.status !== 'success') {
+        throw new Error(`allowlist gagal ${asset.symbol}: ${hash}`);
+      }
+    },
+    onRetry: (attempt, error) => {
+      const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+      ui.warning(`Nonce race pada ${asset.symbol} (${reason}) — percobaan ulang #${attempt}...`);
+    },
+  }));
+
+  const { outcomes, summary } = await allowlistBatch(targets, {
+    onOutcome: (outcome) => {
+      if (outcome.status === 'allowlisted' && outcome.hash) {
+        transactions[`${outcome.label}:${outcome.address}`] = outcome.hash;
+        ui.success(
+          `Allowlisted ${color.yellow(outcome.label)}  ${color.cyan(`${chain.explorer}/tx/${outcome.hash}`)}`,
+        );
+      } else if (outcome.status === 'already-allowed') {
+        ui.info(`Aset ${color.yellow(outcome.label)} sudah ter-allowlist`);
+      }
+    },
+  });
+
+  if (summary.failed > 0) {
+    const names = summary.failures.map((f) => f.label).join(', ');
+    throw new Error(
+      `${summary.failed} aset gagal di-allowlist: ${names}. Jalankan ulang perintah yang sama untuk melanjutkan.`,
+    );
   }
   return transactions;
 }
@@ -680,43 +763,110 @@ async function setupArb(args: ParsedArgs): Promise<void> {
     if (owner.toLowerCase() !== account.address.toLowerCase()) {
       throw new Error(`wallet bukan owner arbExecutor (${owner})`);
     }
-    for (const asset of selected) {
-      const allowed = await publicClient.readContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'allowedToken',
-        args: [asset.address],
+    const escalatedFees = makeFeeEscalator(publicClient);
+    // Allowlist one target at a time through a nonce-race resilient batch: a transient
+    // "nonce too low" from a lagging public RPC is retried after re-reading on-chain state,
+    // a single failure no longer aborts the remaining targets, and retries escalate the fee
+    // so a queued same-nonce transaction can be displaced instead of rejected as underpriced.
+
+    const tokenTargets: AllowlistTarget[] = selected.map((asset) => ({
+      label: asset.symbol,
+      address: asset.address,
+      isAllowed: async () =>
+        Boolean(
+          await publicClient.readContract({
+            address: registeredArb,
+            abi: arbAbi,
+            functionName: 'allowedToken',
+            args: [asset.address],
+          }),
+        ),
+      send: async (attempt: number) =>
+        walletClient.writeContract({
+          address: registeredArb,
+          abi: arbAbi,
+          functionName: 'setTokenAllowed',
+          args: [asset.address, true],
+          ...(await escalatedFees(attempt)),
+        }),
+      confirm: async (hash) => {
+        const receipt = await publicClient.waitForTransactionReceipt({ hash: hash as Hash });
+        if (receipt.status !== 'success') {
+          throw new Error(`setTokenAllowed revert untuk ${asset.symbol}: ${hash}`);
+        }
+      },
+      onRetry: (attempt, error) => {
+        const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+        ui.warning(`Nonce race pada ${asset.symbol} (${reason}) — percobaan ulang #${attempt}...`);
+      },
+    }));
+
+    const routerTargets: AllowlistTarget[] = routers.map((router) => ({
+      label: router.name,
+      address: router.address,
+      isAllowed: async () =>
+        Boolean(
+          await publicClient.readContract({
+            address: registeredArb,
+            abi: arbAbi,
+            functionName: 'allowedRouter',
+            args: [router.address],
+          }),
+        ),
+      send: async (attempt: number) =>
+        walletClient.writeContract({
+          address: registeredArb,
+          abi: arbAbi,
+          functionName: 'setRouterAllowed',
+          args: [router.address, true],
+          ...(await escalatedFees(attempt)),
+        }),
+      confirm: async (hash) => {
+        const receipt = await publicClient.waitForTransactionReceipt({ hash: hash as Hash });
+        if (receipt.status !== 'success') {
+          throw new Error(`setRouterAllowed revert untuk ${router.name}: ${hash}`);
+        }
+      },
+      onRetry: (attempt, error) => {
+        const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+        ui.warning(`Nonce race pada ${router.name} (${reason}) — percobaan ulang #${attempt}...`);
+      },
+    }));
+
+    const runAllowlistBatch = async (
+      kind: 'Token' | 'Router',
+      targets: AllowlistTarget[],
+    ): Promise<ReturnType<typeof summarizeAllowlistOutcomes>> => {
+      const { summary } = await allowlistBatch(targets, {
+        onOutcome: (outcome) => {
+          if (outcome.status === 'allowlisted') {
+            const link = outcome.hash
+              ? `  ${color.cyan(`${result.chain.explorer}/tx/${outcome.hash}`)}`
+              : '';
+            ui.success(`Arb Allowlisted ${kind} ${color.yellow(outcome.label)}${link}`);
+          } else if (outcome.status === 'already-allowed') {
+            ui.info(`Arb ${kind} ${color.yellow(outcome.label)} sudah ter-whitelist`);
+          }
+        },
       });
-      if (allowed) continue;
-      const hash = await walletClient.writeContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'setTokenAllowed',
-        args: [asset.address, true],
-      });
-      await publicClient.waitForTransactionReceipt({ hash });
-      ui.success(`Arb Allowlisted Token ${color.yellow(asset.symbol)}  ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
-    }
-    for (const router of routers) {
-      const allowed = await publicClient.readContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'allowedRouter',
-        args: [router.address],
-      });
-      if (allowed) continue;
-      const hash = await walletClient.writeContract({
-        address: registeredArb,
-        abi: arbAbi,
-        functionName: 'setRouterAllowed',
-        args: [router.address, true],
-      });
-      await publicClient.waitForTransactionReceipt({ hash });
-      ui.success(`Arb Allowlisted Router ${color.cyan(router.name)}  ${color.cyan(`${result.chain.explorer}/tx/${hash}`)}`);
-    }
+      return summary;
+    };
+
+    const tokenSummary = await runAllowlistBatch('Token', tokenTargets);
+    const routerSummary = await runAllowlistBatch('Router', routerTargets);
+
     record.allowedRouters = routers.map((r) => r.address);
     registry[result.chain.key] = record;
     await saveDeployments(registry);
+
+    const failures = [...tokenSummary.failures, ...routerSummary.failures];
+    if (failures.length > 0) {
+      const names = failures.map((f) => f.label).join(', ');
+      throw new Error(
+        `${failures.length} target gagal di-allowlist (transaksi tidak terkirim, gas tidak terpakai): ${names}. ` +
+          'State yang berhasil sudah disimpan — jalankan ulang perintah yang sama untuk melanjutkan (target yang sudah ter-whitelist otomatis dilewati).',
+      );
+    }
     return;
   }
 
@@ -810,6 +960,146 @@ async function arbScan(args: ParsedArgs): Promise<void> {
   }
 }
 
+function renderWatchlistTable(entries: MorphoBorrowerWatchlistEntry[]): void {
+  console.log(
+    renderTable(
+      [
+        { title: 'BORROWER' },
+        { title: 'MARKET' },
+        { title: 'HEALTH FACTOR', align: 'right' },
+        { title: 'BORROW USD', align: 'right' },
+        { title: 'COLLATERAL USD', align: 'right' },
+        { title: 'STATUS' },
+        { title: 'SOURCE' },
+      ],
+      entries.map((entry) => [
+        color.white(shortAddress(entry.borrower)),
+        color.cyan(`${entry.collateralSymbol}/${entry.loanSymbol}`),
+        entry.healthFactor < 1
+          ? color.bold(color.red(entry.healthFactor.toFixed(4)))
+          : color.yellow(entry.healthFactor.toFixed(4)),
+        color.white(`$${Math.round(entry.borrowUsd).toLocaleString('en-US')}`),
+        color.dim(`$${Math.round(entry.collateralUsd).toLocaleString('en-US')}`),
+        entry.status === 'liquidatable'
+          ? color.red('LIQUIDATABLE')
+          : entry.status === 'critical'
+            ? color.yellow('CRITICAL')
+            : color.dim('AT-RISK'),
+        color.dim(entry.source),
+      ]),
+    ),
+  );
+}
+
+async function liquidationScan(args: ParsedArgs): Promise<void> {
+  // `--at-risk` reads the watchlist the daemon already persisted (logs/morpho-watchlist.json), so the
+  // pre-liquidation state can be inspected or cron-queued without paying for a full DEX quote scan.
+  if (hasFlag(args, 'at-risk')) {
+    await loadWatchlistFromDisk();
+    const chainKey = flag(args, 'chain');
+    const entries = getAtRiskWatchlist(chainKey);
+    if (hasFlag(args, 'json')) {
+      console.log(JSON.stringify(entries, (_, value) => (typeof value === 'bigint' ? value.toString() : value), 2));
+      return;
+    }
+    ui.section(`MORPHO PRE-LIQUIDATION WATCHLIST${chainKey ? ` / ${chainKey}` : ' (SEMUA CHAIN)'}`);
+    if (!entries.length) {
+      ui.info(
+        'Watchlist masih kosong. Jalankan `npm run cli -- liq-scan --chain <chain>` sekali atau biarkan daemon `npm run watch` mengisi indeks borrower.',
+      );
+      return;
+    }
+    renderWatchlistTable(entries);
+    ui.info(
+      `${color.white(entries.length)} borrower  ·  ${color.red(entries.filter((e) => e.healthFactor < 1).length)} sudah liquidatable  ·  ${color.yellow(entries.filter((e) => e.healthFactor >= 1).length)} masih di bawah threshold HF<=1.12`,
+    );
+    return;
+  }
+
+  const { result, record } = await runScan(args);
+  const report = await scanChainOpportunities({
+    chain: result.chain,
+    rpcUrl: rpcUrl(result.chain),
+    assets: result.assets,
+    flashExecutor: record.executor ? (getAddress(record.executor) as Address) : undefined,
+    arbExecutor: record.arbExecutor ? (getAddress(record.arbExecutor) as Address) : undefined,
+    arbLoanUsd: numberFlag(args, 'loan-usd', 10_000),
+    minProfitUsd: numberFlag(args, 'min-profit-usd', 5),
+    maxSlippageBps: numberFlag(args, 'max-slippage-bps', 30),
+  });
+
+  const maxHealthFactor = numberFlag(args, 'max-hf', 1.05);
+  const candidates = report.liquidationCandidates
+    .filter((candidate) => candidate.healthFactor <= maxHealthFactor)
+    .sort((a, b) => a.healthFactor - b.healthFactor);
+
+  if (hasFlag(args, 'json')) {
+    console.log(
+      JSON.stringify(
+        { chain: result.chain.key, blockNumber: report.blockNumber, candidates, watchlist: getAtRiskWatchlist(result.chain.key) },
+        (_, value) => (typeof value === 'bigint' ? value.toString() : value),
+        2,
+      ),
+    );
+    return;
+  }
+
+  ui.section(`${result.chain.name.toUpperCase()} / MORPHO LIQUIDATION SCAN`);
+  console.log(
+    `${color.dim('Block')} ${color.white(report.blockNumber)}  ` +
+      `${color.dim('Gas')} ${color.yellow(`${Number(report.gasPriceGwei).toFixed(3)} gwei`)}  ` +
+      `${color.dim('ArbExecutor')} ${record.arbExecutor ? color.cyan(shortAddress(record.arbExecutor)) : color.red('belum dideploy')}  ` +
+      `${color.dim('Max HF')} ${color.white(String(maxHealthFactor))}`,
+  );
+
+  if (!candidates.length) {
+    ui.info(`Tidak ada posisi dengan HF <= ${maxHealthFactor} yang bisa dilikuidasi secara profitabel di ${result.chain.name}.`);
+  } else {
+    console.log(
+      renderTable(
+        [
+          { title: 'BORROWER' },
+          { title: 'MARKET' },
+          { title: 'HF', align: 'right' },
+          { title: 'SEIZED', align: 'right' },
+          { title: 'REPAID USD', align: 'right' },
+          { title: 'INCENTIVE', align: 'right' },
+          { title: 'GAS USD', align: 'right' },
+          { title: 'NET PROFIT', align: 'right' },
+          { title: 'STATUS' },
+        ],
+        candidates.slice(0, 15).map((candidate) => [
+          color.white(shortAddress(candidate.borrower)),
+          color.cyan(`${candidate.marketParams.collateralSymbol}/${candidate.marketParams.loanSymbol}`),
+          candidate.healthFactor < 1
+            ? color.bold(color.red(candidate.healthFactor.toFixed(4)))
+            : color.yellow(candidate.healthFactor.toFixed(4)),
+          color.dim(candidate.formattedSeizedAssets),
+          color.white(`$${Math.round(candidate.repaidUsd).toLocaleString('en-US')}`),
+          color.dim(`${(candidate.incentiveBps / 100).toFixed(2)}%`),
+          color.dim(`$${candidate.estimatedGasCostUsd.toFixed(4)}`),
+          candidate.profitable
+            ? color.bold(color.green(`+$${candidate.netProfitUsd.toFixed(2)}`))
+            : color.dim(`$${candidate.netProfitUsd.toFixed(2)}`),
+          candidate.profitable ? color.green('PROFITABLE') : color.dim('BELOW MIN'),
+        ]),
+      ),
+    );
+  }
+
+  if (!record.arbExecutor) {
+    ui.warning(
+      `Likuidasi butuh MorphoAtomicArbPOC di chain ini. Deploy dengan: npm run cli -- setup-arb --chain ${result.chain.key} --broadcast --yes`,
+    );
+  }
+
+  const watchlist = getAtRiskWatchlist(result.chain.key);
+  if (watchlist.length) {
+    ui.section('PRE-LIQUIDATION WATCHLIST (1.00 <= HF <= 1.12)');
+    renderWatchlistTable(watchlist);
+  }
+}
+
 async function interactiveMenu(args: ParsedArgs): Promise<void> {
   console.log(renderBanner());
   console.log(centerBlock(color.bold(color.cyan('MAIN MENU'))));
@@ -821,6 +1111,7 @@ async function interactiveMenu(args: ParsedArgs): Promise<void> {
       [color.magenta('3'), color.green('RUN FLASHLOAN'), color.dim('Borrow and repay in one tx')],
       [color.magenta('4'), color.cyan('LLM WATCH OPERATOR'), color.dim('VPS daemon: watch whitelist & profit')],
       [color.magenta('5'), color.yellow('ARB EXECUTOR SETUP'), color.dim('Deploy or sync MorphoAtomicArbPOC')],
+      [color.magenta('6'), color.red('LIQUIDATION WATCHLIST'), color.dim('At-risk borrowers & liquidation candidates')],
       [color.dim('0'), color.dim('EXIT'), color.dim('Close toolkit')],
     ],
   )));
@@ -828,12 +1119,12 @@ async function interactiveMenu(args: ParsedArgs): Promise<void> {
   const readline = createInterface({ input, output });
   let answer: string;
   try {
-    answer = (await readline.question(centerBlock(promptText('Pilih menu', '[0-5]')))).trim();
+    answer = (await readline.question(centerBlock(promptText('Pilih menu', '[0-6]')))).trim();
   } finally {
     readline.close();
   }
   if (answer === '0') return;
-  if (!['1', '2', '3', '4', '5'].includes(answer)) throw new Error(`menu tidak valid: ${answer}`);
+  if (!['1', '2', '3', '4', '5', '6'].includes(answer)) throw new Error(`menu tidak valid: ${answer}`);
   const chain = await promptChain(answer === '3');
   const chainArgs = withFlag(withFlag(args, 'chain', chain.key), 'compact-ui', 'true');
   if (answer === '1') {
@@ -845,8 +1136,10 @@ async function interactiveMenu(args: ParsedArgs): Promise<void> {
     await runFlashLoan(chainArgs);
   } else if (answer === '4') {
     await runWatchDaemon({ chains: [chain.key] });
-  } else {
+  } else if (answer === '5') {
     await setupArb(chainArgs);
+  } else {
+    await liquidationScan(chainArgs);
   }
 }
 
@@ -920,6 +1213,8 @@ Usage:
   npm run cli -- scan  --chain ethereum [--min-usd 100000] [--token 0x...]
   npm run cli -- scan-all [--chains ethereum,base,arbitrum] [--min-usd 100000]
   npm run cli -- arb-scan --chain base [--loan-usd 10000] [--min-profit-usd 5]
+  npm run cli -- liq-scan --chain base [--max-hf 1.05] [--min-profit-usd 5]
+  npm run cli -- liq-scan --at-risk [--chain base] [--json]
   npm run cli -- setup --chain ethereum [--min-usd 100000] [--select all|1,2|USDC,WETH]
   npm run cli -- setup-arb --chain base [--select USDC,WETH] [--broadcast]
   npm run cli -- flashloan --chain ethereum --asset WETH --amount 10 [--broadcast]
@@ -966,6 +1261,9 @@ async function main(): Promise<void> {
       break;
     case 'arb-scan':
       await arbScan(args);
+      break;
+    case 'liq-scan':
+      await liquidationScan(args);
       break;
     case 'setup':
       await setup(args);
