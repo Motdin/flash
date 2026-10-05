@@ -9,3 +9,9 @@ optimizer_runs = 200
 
 via_ir = true
 evm_version = "shanghai"
+
+
+# Explicit, network-backed integration profile. Kept separate so plain `forge test`
+# remains deterministic and does not require RPC access.
+[profile.fork]
+test = "fork-test"
