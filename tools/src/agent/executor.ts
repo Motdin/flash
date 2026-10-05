@@ -23,6 +23,7 @@ import {
   type Address,
 } from '../config/registry.js';
 import type { ChainOpportunityReport } from '../morpho/dex-scanner.js';
+import { buildWhitelistCooldownKey, rememberExecutionCooldown, type ExecutionCooldowns } from './cooldown.js';
 import type {
   ArbitrageExecutionPlan,
   LlmOperatorConfig,
@@ -95,9 +96,54 @@ export function resolveBroadcastRpc(
 }
 
 /**
- * Computes dynamic priority fee (validator bribe) from expected profit surplus
- * while preserving `minProfitUsd`.
+ * Rejects live transactions whose expected USD profit cannot cover the maximum configured fee.
+ * A 20% gas-unit margin accounts for estimation variance.
  */
+export function estimateExecutionNetProfitAfterGas(params: {
+  expectedGrossProfitUsd: number;
+  minimumProfitUsd: number;
+  maxFeePerGas: bigint;
+  estimatedGasUnits: bigint;
+  nativePriceUsd: number;
+}): { gasCostUsd: number; estimatedNetProfitUsd: number } {
+  const {
+    expectedGrossProfitUsd,
+    minimumProfitUsd,
+    maxFeePerGas,
+    estimatedGasUnits,
+    nativePriceUsd,
+  } = params;
+  if (
+    !Number.isFinite(expectedGrossProfitUsd) ||
+    !Number.isFinite(minimumProfitUsd) ||
+    minimumProfitUsd < 0 ||
+    !Number.isFinite(nativePriceUsd) ||
+    nativePriceUsd <= 0 ||
+    maxFeePerGas <= 0n ||
+    estimatedGasUnits <= 0n
+  ) {
+    throw new Error('Tidak dapat menghitung profit bersih: harga native/gas estimate tidak valid.');
+  }
+
+  // Give the RPC gas estimate a 20% execution margin before deciding to spend funds.
+  const bufferedGasUnits = (estimatedGasUnits * 120n + 99n) / 100n;
+  // maxFeePerGas is the transaction's upper bound, so the guard remains valid if base fee rises.
+  const estimatedGasWei = maxFeePerGas * bufferedGasUnits;
+  const gasCostUsd = Number(formatUnits(estimatedGasWei, 18)) * nativePriceUsd;
+  const estimatedNetProfitUsd = expectedGrossProfitUsd - gasCostUsd;
+  if (!Number.isFinite(gasCostUsd) || !Number.isFinite(estimatedNetProfitUsd)) {
+    throw new Error('Tidak dapat menghitung profit bersih dari estimasi biaya gas.');
+  }
+  if (estimatedNetProfitUsd < minimumProfitUsd) {
+    throw new Error(
+      `Net-profit guard: estimasi profit setelah gas $${estimatedNetProfitUsd.toFixed(2)} ` +
+        `< minimum $${minimumProfitUsd.toFixed(2)} (estimasi gas $${gasCostUsd.toFixed(2)}).`,
+    );
+  }
+  return { gasCostUsd, estimatedNetProfitUsd };
+}
+
+/** Computes a dynamic EIP-1559 priority fee from expected profit surplus. */
 export function computeDynamicPriorityFee(params: {
   baseGasPriceWei: bigint;
   estimatedGasUnits: bigint;
@@ -219,15 +265,39 @@ export function resolveAutoAllowlistTargets(plan: ArbitrageExecutionPlan): {
   return { tokens: dedupe(tokenCandidates), routers: dedupe(routerCandidates) };
 }
 
+export function isAutomaticAllowlistBlocked(
+  decision: OperatorDecision,
+  config: LlmOperatorConfig,
+): boolean {
+  if (config.whitelistAutoSync) return false;
+  if (decision.action === 'SYNC_WHITELIST') return true;
+  return decision.action === 'EXECUTE_ARBITRAGE' &&
+    Boolean(decision.arbitragePlan?.autoAllowlistBeforeExec);
+}
+
 export async function executeOperatorDecision(params: {
   decision: OperatorDecision;
   report: ChainOpportunityReport;
   config: LlmOperatorConfig;
   rpcUrl: string;
-  recentExecutedKeys: Set<string>;
+  recentExecutedKeys: ExecutionCooldowns;
 }): Promise<ExecutionOutcome> {
   const { decision, report, config, rpcUrl, recentExecutedKeys } = params;
   const timestamp = new Date().toISOString();
+
+  if (isAutomaticAllowlistBlocked(decision, config)) {
+    return {
+      action: 'HOLD',
+      chain: report.chain.key,
+      simulated: false,
+      simulationSuccess: false,
+      broadcasted: false,
+      txHashes: [],
+      explorerUrls: [],
+      summary: 'Policy Guard: auto-allowlist dinonaktifkan (WHITELIST_AUTO_SYNC=false); tidak ada transaksi allowlist atau arbitrase yang dikirim.',
+      timestamp,
+    };
+  }
 
   if (decision.action === 'HOLD') {
     return {
@@ -255,7 +325,6 @@ export async function executeOperatorDecision(params: {
   if (isOfflineSimulation && !shouldBroadcast) {
     if (decision.action === 'SYNC_WHITELIST' && decision.whitelistPlan) {
       const tokens = decision.whitelistPlan.tokensToAllow.map((t) => t.symbol).join(', ');
-      recentExecutedKeys.add(`whitelist:${report.chain.key}:${tokens}`);
       return {
         action: 'SYNC_WHITELIST',
         chain: report.chain.key,
@@ -270,7 +339,6 @@ export async function executeOperatorDecision(params: {
     }
     if (decision.action === 'EXECUTE_ARBITRAGE' && decision.arbitragePlan) {
       const p = decision.arbitragePlan;
-      recentExecutedKeys.add(`arb:${p.candidateId}`);
       return {
         action: 'EXECUTE_ARBITRAGE',
         chain: report.chain.key,
@@ -285,7 +353,6 @@ export async function executeOperatorDecision(params: {
     }
     if (decision.action === 'EXECUTE_LIQUIDATION' && decision.liquidationPlan) {
       const p = decision.liquidationPlan;
-      recentExecutedKeys.add(`liq:${p.candidateId}`);
       return {
         action: 'EXECUTE_LIQUIDATION',
         chain: report.chain.key,
@@ -300,7 +367,6 @@ export async function executeOperatorDecision(params: {
     }
     if (decision.action === 'EXECUTE_FLASHLOAN' && decision.flashloanPlan) {
       const p = decision.flashloanPlan;
-      recentExecutedKeys.add(`flashloan:${report.chain.key}:${p.symbol}`);
       return {
         action: 'EXECUTE_FLASHLOAN',
         chain: report.chain.key,
@@ -462,8 +528,12 @@ export async function executeOperatorDecision(params: {
         await saveDeployments(registry);
       }
 
-      const cooldownKey = `whitelist:${report.chain.key}:${plan.tokensToAllow.map((t) => t.symbol).join(',')}`;
-      recentExecutedKeys.add(cooldownKey);
+      const cooldownKey = buildWhitelistCooldownKey(
+        report.chain.key,
+        plan.tokensToAllow,
+        plan.routersToAllow,
+      );
+      if (txHashes.length > 0) rememberExecutionCooldown(recentExecutedKeys, cooldownKey);
 
       return {
         action: 'SYNC_WHITELIST',
@@ -539,7 +609,9 @@ export async function executeOperatorDecision(params: {
         }
       }
 
-      recentExecutedKeys.add(`flashloan:${report.chain.key}:${plan.symbol}`);
+      if (txHashes.length > 0) {
+        rememberExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${plan.symbol}`);
+      }
 
       return {
         action: 'EXECUTE_FLASHLOAN',
@@ -559,7 +631,6 @@ export async function executeOperatorDecision(params: {
     // 3. Handle EXECUTE_ARBITRAGE (Supports V2, V3, and Aerodrome)
     if (decision.action === 'EXECUTE_ARBITRAGE' && decision.arbitragePlan) {
       const plan = decision.arbitragePlan;
-      recentExecutedKeys.add(`arb:${plan.candidateId}`);
 
       if (!report.arbExecutor || !report.arbExecutorOwner) {
         return {
@@ -579,6 +650,7 @@ export async function executeOperatorDecision(params: {
         ? (getAddress(process.env.PROFIT_RECEIVER) as Address)
         : report.arbExecutorOwner;
       const deadline = BigInt(Math.floor(Date.now() / 1000) + plan.deadlineSeconds);
+      if (shouldBroadcast) rememberExecutionCooldown(recentExecutedKeys, `arb:${plan.candidateId}`);
 
       if (plan.autoAllowlistBeforeExec && shouldBroadcast && walletClient && account) {
         const { tokens: tokensNeeded, routers: routersNeeded } = resolveAutoAllowlistTargets(plan);
@@ -661,15 +733,18 @@ export async function executeOperatorDecision(params: {
         });
         simulatedProfit = simResult.result;
 
-        estimatedGasUnits = await publicClient
-          .estimateContractGas({
+        try {
+          estimatedGasUnits = await publicClient.estimateContractGas({
             account: callerAccount,
             address: report.arbExecutor,
             abi: arbExecutorAbi,
             functionName: 'executeMultiHopArbitrage',
             args: [multiHopStruct],
-          })
-          .catch(() => 390_000n);
+          });
+        } catch (error) {
+          if (shouldBroadcast) throw new Error(`Estimasi gas multi-hop gagal; transaksi live dibatalkan: ${error instanceof Error ? error.message : String(error)}`);
+          estimatedGasUnits = 390_000n;
+        }
 
         const priorityFee = computeDynamicPriorityFee({
           baseGasPriceWei: report.gasPriceWei,
@@ -680,6 +755,15 @@ export async function executeOperatorDecision(params: {
           profitBribeBps: config.profitBribeBps,
           maxPriorityFeeGwei: config.maxPriorityFeeGwei,
         });
+        if (shouldBroadcast) {
+          estimateExecutionNetProfitAfterGas({
+            expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
+            minimumProfitUsd: config.minProfitUsd,
+            maxFeePerGas: priorityFee.maxFeePerGas,
+            estimatedGasUnits,
+            nativePriceUsd: report.nativePriceUsd,
+          });
+        }
 
         if (shouldBroadcast && walletClient && account && pk) {
           const bundleEnabled = process.env.MEV_BUNDLE_ENABLED === 'true';
@@ -841,15 +925,18 @@ export async function executeOperatorDecision(params: {
         });
         simulatedProfit = simResult.result;
 
-        estimatedGasUnits = await publicClient
-          .estimateContractGas({
+        try {
+          estimatedGasUnits = await publicClient.estimateContractGas({
             account: callerAccount,
             address: report.arbExecutor,
             abi: arbExecutorAbi,
             functionName: 'executeArbitrage',
             args: [v2Struct],
-          })
-          .catch(() => 280_000n);
+          });
+        } catch (error) {
+          if (shouldBroadcast) throw new Error(`Estimasi gas arbitrase V2 gagal; transaksi live dibatalkan: ${error instanceof Error ? error.message : String(error)}`);
+          estimatedGasUnits = 280_000n;
+        }
 
         const priorityFee = computeDynamicPriorityFee({
           baseGasPriceWei: report.gasPriceWei,
@@ -860,6 +947,15 @@ export async function executeOperatorDecision(params: {
           profitBribeBps: config.profitBribeBps,
           maxPriorityFeeGwei: config.maxPriorityFeeGwei,
         });
+        if (shouldBroadcast) {
+          estimateExecutionNetProfitAfterGas({
+            expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
+            minimumProfitUsd: config.minProfitUsd,
+            maxFeePerGas: priorityFee.maxFeePerGas,
+            estimatedGasUnits,
+            nativePriceUsd: report.nativePriceUsd,
+          });
+        }
 
         if (shouldBroadcast && walletClient && account) {
           const hash = await walletClient.writeContract({
@@ -912,15 +1008,18 @@ export async function executeOperatorDecision(params: {
         });
         simulatedProfit = simResult.result;
 
-        estimatedGasUnits = await publicClient
-          .estimateContractGas({
+        try {
+          estimatedGasUnits = await publicClient.estimateContractGas({
             account: callerAccount,
             address: report.arbExecutor,
             abi: arbExecutorAbi,
             functionName: 'executeMultiDexArbitrage',
             args: [multiStruct],
-          })
-          .catch(() => 320_000n);
+          });
+        } catch (error) {
+          if (shouldBroadcast) throw new Error(`Estimasi gas multi-DEX gagal; transaksi live dibatalkan: ${error instanceof Error ? error.message : String(error)}`);
+          estimatedGasUnits = 320_000n;
+        }
 
         const priorityFee = computeDynamicPriorityFee({
           baseGasPriceWei: report.gasPriceWei,
@@ -931,6 +1030,15 @@ export async function executeOperatorDecision(params: {
           profitBribeBps: config.profitBribeBps,
           maxPriorityFeeGwei: config.maxPriorityFeeGwei,
         });
+        if (shouldBroadcast) {
+          estimateExecutionNetProfitAfterGas({
+            expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
+            minimumProfitUsd: config.minProfitUsd,
+            maxFeePerGas: priorityFee.maxFeePerGas,
+            estimatedGasUnits,
+            nativePriceUsd: report.nativePriceUsd,
+          });
+        }
 
         if (shouldBroadcast && walletClient && account) {
           const hash = await walletClient.writeContract({
@@ -971,7 +1079,6 @@ export async function executeOperatorDecision(params: {
     // 4. Handle EXECUTE_LIQUIDATION (Morpho Blue Atomic Liquidation)
     if (decision.action === 'EXECUTE_LIQUIDATION' && decision.liquidationPlan) {
       const plan = decision.liquidationPlan;
-      recentExecutedKeys.add(`liq:${plan.candidateId}`);
 
       if (!report.arbExecutor || !report.arbExecutorOwner) {
         return {
@@ -991,6 +1098,7 @@ export async function executeOperatorDecision(params: {
         ? (getAddress(process.env.PROFIT_RECEIVER) as Address)
         : report.arbExecutorOwner;
       const deadline = BigInt(Math.floor(Date.now() / 1000) + plan.deadlineSeconds);
+      if (shouldBroadcast) rememberExecutionCooldown(recentExecutedKeys, `liq:${plan.candidateId}`);
       const callerAccount = account?.address ?? report.arbExecutorOwner;
 
       const liqStruct = {
@@ -1028,15 +1136,38 @@ export async function executeOperatorDecision(params: {
       const simulatedProfit = simResult.result;
       const formattedProfit = formatUnits(simulatedProfit, plan.loanDecimals);
 
+      let estimatedGasUnits: bigint;
+      try {
+        estimatedGasUnits = await publicClient.estimateContractGas({
+          account: callerAccount,
+          address: report.arbExecutor,
+          abi: arbExecutorAbi,
+          functionName: 'executeLiquidation',
+          args: [liqStruct],
+        });
+      } catch (error) {
+        if (shouldBroadcast) throw new Error(`Estimasi gas likuidasi gagal; transaksi live dibatalkan: ${error instanceof Error ? error.message : String(error)}`);
+        estimatedGasUnits = 350_000n;
+      }
+
       const priorityFee = computeDynamicPriorityFee({
         baseGasPriceWei: report.gasPriceWei,
-        estimatedGasUnits: 350_000n,
+        estimatedGasUnits,
         nativePriceUsd: report.nativePriceUsd,
         expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
         minProfitUsd: config.minProfitUsd,
         profitBribeBps: config.profitBribeBps,
         maxPriorityFeeGwei: config.maxPriorityFeeGwei,
       });
+      if (shouldBroadcast) {
+        estimateExecutionNetProfitAfterGas({
+          expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
+          minimumProfitUsd: config.minProfitUsd,
+          maxFeePerGas: priorityFee.maxFeePerGas,
+          estimatedGasUnits,
+          nativePriceUsd: report.nativePriceUsd,
+        });
+      }
 
       if (shouldBroadcast && walletClient && account) {
         const hash = await walletClient.writeContract({

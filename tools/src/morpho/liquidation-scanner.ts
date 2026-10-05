@@ -9,18 +9,26 @@ import {
   parseUnits,
 } from 'viem';
 import type { EvmChainConfig } from '../config/chains.js';
+import { deploymentFor, loadDeployments } from '../config/registry.js';
 import type { DexRouterConfig } from '../config/dex-routers.js';
 import type { Address } from '../config/registry.js';
 import { applySlippageBps } from './dex-scanner.js';
 
-const MORPHO_BLUE_SINGLETON = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as Address;
 
 const MORPHO_APIS = [
   'https://blue-api.morpho.org/graphql',
   'https://api.morpho.org/graphql',
 ];
 const REQUEST_TIMEOUT_MS = 10_000;
+const POSITION_PAGE_SIZE = 100;
+const DEFAULT_MAX_POSITION_PAGES = 50;
 const WAD = 10n ** 18n;
+
+function configuredMaxPositionPages(): number {
+  const configured = Number(process.env.MORPHO_LIQUIDATION_MAX_PAGES ?? DEFAULT_MAX_POSITION_PAGES);
+  const pages = Math.floor(configured);
+  return Number.isFinite(configured) && pages > 0 ? pages : DEFAULT_MAX_POSITION_PAGES;
+}
 const MAX_LIF_BPS = 11_500; // 1.15x max liquidation incentive in Morpho Blue
 const LIF_CURSOR = 0.3;
 
@@ -80,6 +88,18 @@ export type LiquidationCandidate = {
 };
 
 const watchlistMemory = new Map<string, MorphoBorrowerWatchlistEntry>();
+
+function watchlistEntryKey(chainKey: string, marketId: string, borrower: string): string {
+  return `${chainKey}:${marketId.toLowerCase()}:${borrower.toLowerCase()}`;
+}
+
+export function pruneGraphqlWatchlist(chainKey: string, seenKeys: Set<string>): void {
+  for (const [key, entry] of watchlistMemory) {
+    if (entry.chain === chainKey && entry.source === 'graphql-indexer' && !seenKeys.has(key)) {
+      watchlistMemory.delete(key);
+    }
+  }
+}
 
 export function upsertWatchlistEntry(entry: MorphoBorrowerWatchlistEntry): void {
   watchlistMemory.set(entry.key, entry);
@@ -189,7 +209,7 @@ export function evaluateLiquidationCandidate(params: {
   const status = classifyHealthFactorStatus(healthFactor);
   if (status !== 'healthy') {
     upsertWatchlistEntry({
-      key: `${chainKey}:${market.marketId}:${borrower.toLowerCase()}`,
+      key: watchlistEntryKey(chainKey, market.marketId, borrower),
       chain: chainKey,
       borrower,
       marketId: market.marketId,
@@ -274,10 +294,31 @@ export function evaluateLiquidationCandidate(params: {
   };
 }
 
+type MorphoApiPosition = {
+  healthFactor?: number;
+  borrowAssetsUsd?: number;
+  collateralUsd?: number;
+  user?: { address?: string };
+  market?: {
+    uniqueKey?: string;
+    lltv?: string;
+    oracleAddress?: string;
+    irmAddress?: string;
+    loanAsset?: { address?: string; symbol?: string; decimals?: number; priceUsd?: number };
+    collateralAsset?: { address?: string; symbol?: string; decimals?: number; priceUsd?: number };
+  };
+};
+
+type MorphoPositionsPageResult = {
+  items: MorphoApiPosition[];
+  complete: boolean;
+};
+
 const liquidationPositionsQuery = `
-  query ScanLiquidatableAndAtRiskPositions($chainId: Int!) {
+  query ScanLiquidatableAndAtRiskPositions($chainId: Int!, $first: Int!, $skip: Int!) {
     marketPositions(
-      first: 100
+      first: $first
+      skip: $skip
       where: { chainId_in: [$chainId], healthFactor_lte: 1.12, borrowAssetsUsd_gte: 100 }
     ) {
       items {
@@ -298,6 +339,40 @@ const liquidationPositionsQuery = `
   }
 `;
 
+export async function fetchLiquidationPositionPages(
+  endpoint: string,
+  chainId: number,
+): Promise<MorphoPositionsPageResult> {
+  const maxPages = configuredMaxPositionPages();
+  const items: MorphoApiPosition[] = [];
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query: liquidationPositionsQuery,
+        variables: { chainId, first: POSITION_PAGE_SIZE, skip: page * POSITION_PAGE_SIZE },
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`Morpho API HTTP ${res.status}`);
+    const body = await res.json() as {
+      errors?: Array<{ message?: string }>;
+      data?: { marketPositions?: { items?: MorphoApiPosition[] } };
+    };
+    if (body.errors?.length) {
+      throw new Error(body.errors.map((error) => error.message ?? 'GraphQL error').join('; '));
+    }
+    const pageItems = body.data?.marketPositions?.items;
+    if (!Array.isArray(pageItems)) throw new Error('Morpho API tidak mengembalikan marketPositions.items');
+    items.push(...pageItems);
+    if (pageItems.length < POSITION_PAGE_SIZE) return { items, complete: true };
+  }
+
+  return { items, complete: false };
+}
+
 const borrowEventAbi = parseAbiItem(
   'event Borrow(bytes32 indexed id, address caller, address indexed onBehalf, address indexed receiver, uint256 assets, uint256 shares)',
 );
@@ -315,10 +390,13 @@ export async function discoverOnChainMorphoBorrowers(params: {
     const client = createPublicClient({
       transport: http(rpcUrl, { timeout: 6_000, retryCount: 0 }),
     });
+    const deployments = await loadDeployments();
+    const morphoAddress = deploymentFor(deployments, chain.key)?.morpho;
+    if (!morphoAddress) return [];
     const head = await client.getBlockNumber();
     const fromBlock = head > blockLookback ? head - blockLookback : 0n;
     const logs = await client.getLogs({
-      address: MORPHO_BLUE_SINGLETON,
+      address: getAddress(morphoAddress) as Address,
       event: borrowEventAbi,
       fromBlock,
       toBlock: head,
@@ -341,16 +419,24 @@ export async function discoverOnChainMorphoBorrowers(params: {
   }
 }
 
+export type LiquidationScanResult = {
+  candidates: LiquidationCandidate[];
+  warnings: string[];
+};
+
 export async function scanMorphoLiquidations(params: {
   chain: EvmChainConfig;
-  rpcUrl?: string;
   routers: DexRouterConfig[];
   gasCostUsd: number;
   minProfitUsd: number;
   maxSlippageBps: number;
-}): Promise<LiquidationCandidate[]> {
-  const { chain, rpcUrl, routers, gasCostUsd, minProfitUsd, maxSlippageBps } = params;
-  if (routers.length === 0) return [];
+}): Promise<LiquidationScanResult> {
+  const { chain, routers, gasCostUsd, minProfitUsd, maxSlippageBps } = params;
+  const warnings: string[] = [];
+  if (routers.length === 0) {
+    warnings.push('Morpho liquidation scan dilewati: tidak ada router DEX dengan quote yang valid pada chain ini.');
+    return { candidates: [], warnings };
+  }
   // Pick the lowest-fee router for collateral liquidation swap
   const sortedRouters = [...routers].sort((a, b) => a.feeBps - b.feeBps);
   const bestRouter = sortedRouters[0];
@@ -397,75 +483,67 @@ export async function scanMorphoLiquidations(params: {
     }
   }
 
-  // 2. Query Morpho Blue GraphQL API (Indexes both liquidatable < 1.0 and at-risk 1.00..1.12 positions)
+  // 2. Query every page of Morpho positions at-risk or currently liquidatable.
+  let indexedPositions: MorphoApiPosition[] | undefined;
+  let positionSnapshotComplete = false;
+  let lastApiError: unknown;
   for (const apiEndpoint of MORPHO_APIS) {
     try {
-      const res = await fetch(apiEndpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          query: liquidationPositionsQuery,
-          variables: { chainId: chain.chainId },
-        }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) continue;
-      const body = (await res.json()) as {
-        data?: {
-          marketPositions?: {
-            items?: Array<{
-              healthFactor?: number;
-              borrowAssetsUsd?: number;
-              collateralUsd?: number;
-              user?: { address?: string };
-              market?: {
-                uniqueKey?: string;
-                lltv?: string;
-                oracleAddress?: string;
-                irmAddress?: string;
-                loanAsset?: { address?: string; symbol?: string; decimals?: number; priceUsd?: number };
-                collateralAsset?: { address?: string; symbol?: string; decimals?: number; priceUsd?: number };
-              };
-            }>;
-          };
-        };
-      };
+      const result = await fetchLiquidationPositionPages(apiEndpoint, chain.chainId);
+      indexedPositions = result.items;
+      positionSnapshotComplete = result.complete;
+      break;
+    } catch (error) {
+      lastApiError = error;
+    }
+  }
 
-      const items = body.data?.marketPositions?.items;
-      if (!items) continue;
-
-      for (const item of items) {
-        const m = item.market;
+  if (!indexedPositions) {
+    warnings.push(
+      `Morpho GraphQL liquidation scan gagal: ${lastApiError instanceof Error ? lastApiError.message : String(lastApiError ?? 'API tidak tersedia')}`,
+    );
+  } else {
+    const seenWatchlistKeys = new Set<string>();
+    let malformedPositionCount = 0;
+    for (const item of indexedPositions) {
+      try {
+        const market = item.market;
+        const borrowerAddress = item.user?.address;
+        if (!borrowerAddress || !market?.uniqueKey) {
+          malformedPositionCount += 1;
+          continue;
+        }
+        const normalizedBorrower = getAddress(borrowerAddress) as Address;
+        seenWatchlistKeys.add(watchlistEntryKey(chain.key, market.uniqueKey, normalizedBorrower));
         if (
-          !item.user?.address ||
-          !m?.uniqueKey ||
-          !m.loanAsset?.address ||
-          !m.collateralAsset?.address ||
-          !m.oracleAddress ||
-          !m.irmAddress
+          !market.loanAsset?.address ||
+          !market.collateralAsset?.address ||
+          !market.oracleAddress ||
+          !market.irmAddress
         ) {
+          malformedPositionCount += 1;
           continue;
         }
 
         const marketConfig: MorphoMarketParamsConfig = {
-          marketId: m.uniqueKey as `0x${string}`,
-          loanToken: getAddress(m.loanAsset.address) as Address,
-          loanSymbol: m.loanAsset.symbol ?? 'LOAN',
-          loanDecimals: m.loanAsset.decimals ?? 18,
-          loanPriceUsd: m.loanAsset.priceUsd ?? 1,
-          collateralToken: getAddress(m.collateralAsset.address) as Address,
-          collateralSymbol: m.collateralAsset.symbol ?? 'COLL',
-          collateralDecimals: m.collateralAsset.decimals ?? 18,
-          collateralPriceUsd: m.collateralAsset.priceUsd ?? 1,
-          oracle: getAddress(m.oracleAddress) as Address,
-          irm: getAddress(m.irmAddress) as Address,
-          lltv: BigInt(m.lltv ?? '860000000000000000'),
+          marketId: market.uniqueKey as `0x${string}`,
+          loanToken: getAddress(market.loanAsset.address) as Address,
+          loanSymbol: market.loanAsset.symbol ?? 'LOAN',
+          loanDecimals: market.loanAsset.decimals ?? 18,
+          loanPriceUsd: market.loanAsset.priceUsd ?? 1,
+          collateralToken: getAddress(market.collateralAsset.address) as Address,
+          collateralSymbol: market.collateralAsset.symbol ?? 'COLL',
+          collateralDecimals: market.collateralAsset.decimals ?? 18,
+          collateralPriceUsd: market.collateralAsset.priceUsd ?? 1,
+          oracle: getAddress(market.oracleAddress) as Address,
+          irm: getAddress(market.irmAddress) as Address,
+          lltv: BigInt(market.lltv ?? '860000000000000000'),
         };
 
         const candidate = evaluateLiquidationCandidate({
           chainKey: chain.key,
           market: marketConfig,
-          borrower: getAddress(item.user.address) as Address,
+          borrower: getAddress(borrowerAddress) as Address,
           borrowUsd: item.borrowAssetsUsd ?? 0,
           collateralUsd: item.collateralUsd ?? 0,
           swapRouter: bestRouter,
@@ -473,20 +551,25 @@ export async function scanMorphoLiquidations(params: {
           minProfitUsd,
           maxSlippageBps,
         });
-
-        if (candidate) {
-          candidates.push(candidate);
-        }
+        if (candidate) candidates.push(candidate);
+      } catch {
+        malformedPositionCount += 1;
       }
-      break;
-    } catch {
-      // Try next GraphQL endpoint
     }
-  }
 
-  // 3. Optionally index recent on-chain Borrow events if RPC is provided
-  if (rpcUrl && process.env.ONCHAIN_BORROW_INDEXER_ENABLED === 'true') {
-    await discoverOnChainMorphoBorrowers({ chain, rpcUrl });
+    if (positionSnapshotComplete && malformedPositionCount === 0) {
+      pruneGraphqlWatchlist(chain.key, seenWatchlistKeys);
+      await persistWatchlistToDisk();
+    } else if (positionSnapshotComplete) {
+      warnings.push(
+        `Morpho snapshot berisi ${malformedPositionCount} posisi tidak valid; watchlist tidak direkonsiliasi agar entri yang sah tidak terhapus.`,
+      );
+    } else {
+      const maxPages = configuredMaxPositionPages();
+      warnings.push(
+        `Morpho liquidation scan mencapai batas ${POSITION_PAGE_SIZE * maxPages} posisi; hasil mungkin belum lengkap. Naikkan MORPHO_LIQUIDATION_MAX_PAGES.`,
+      );
+    }
   }
 
   if (watchlistMemory.size > 0) {
@@ -494,5 +577,5 @@ export async function scanMorphoLiquidations(params: {
   }
 
   candidates.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
-  return candidates;
+  return { candidates, warnings };
 }

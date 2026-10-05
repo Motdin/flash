@@ -181,7 +181,14 @@ export type OpportunityScanOptions = {
   maxSlippageBps?: number;
   maxAssetsToPair?: number;
   enableTriangularArb?: boolean;
-  extraRouters?: Array<{ name?: string; address: string; feeBps?: number; kind?: RouterKindId; v3FeeTier?: number }>;
+  extraRouters?: Array<{
+    name?: string;
+    address: string;
+    feeBps?: number;
+    kind?: RouterKindId;
+    v3FeeTier?: number;
+    quoterAddress?: string;
+  }>;
 };
 
 export function applySlippageBps(amount: bigint, slippageBps: number): bigint {
@@ -648,13 +655,22 @@ type QuoteCallRequest = {
   tokenOut: Address;
 };
 
+function isRouterQuoteable(router: DexRouterConfig): boolean {
+  if (router.kind === 1 || router.kind === 2 || router.kind === 5) {
+    return Boolean(router.quoterAddress);
+  }
+  if (router.kind === 3) return Boolean(router.factoryAddress);
+  return true;
+}
+
 async function readSingleRouterQuote(
   client: PublicClient,
   req: QuoteCallRequest,
 ): Promise<bigint> {
   const { router, amountIn, tokenIn, tokenOut } = req;
+  if (!isRouterQuoteable(router)) return 0n;
   try {
-    if ((router.kind === 1 || router.kind === 2) && router.quoterAddress) {
+    if ((router.kind === 1 || router.kind === 2 || router.kind === 5) && router.quoterAddress) {
       const res = await client.readContract({
         address: router.quoterAddress,
         abi: v3QuoterV2Abi,
@@ -692,6 +708,8 @@ async function readSingleRouterQuote(
       return amounts[amounts.length - 1] ?? 0n;
     }
 
+    if (router.kind === 5) return 0n;
+
     if (router.kind === 4) {
       const { i, j } = decodeCurveIndices(router.v3FeeTier ?? 1);
       return await client.readContract({
@@ -719,10 +737,13 @@ async function batchReadMultiDexQuotes(
   calls: QuoteCallRequest[],
 ): Promise<bigint[]> {
   if (calls.length === 0) return [];
+  const quoteableCalls = calls.filter((req) => isRouterQuoteable(req.router));
+  if (quoteableCalls.length === 0) return calls.map(() => 0n);
+
   try {
-    const contracts = calls.map((req) => {
+    const contracts = quoteableCalls.map((req) => {
       const { router, amountIn, tokenIn, tokenOut } = req;
-      if ((router.kind === 1 || router.kind === 2) && router.quoterAddress) {
+      if ((router.kind === 1 || router.kind === 2 || router.kind === 5) && router.quoterAddress) {
         return {
           address: router.quoterAddress,
           abi: v3QuoterV2Abi,
@@ -780,10 +801,10 @@ async function batchReadMultiDexQuotes(
       contracts,
     });
 
-    return results.map((res, idx) => {
+    const quoteableOutputs = results.map((res, idx) => {
       if (res.status !== 'success' || !res.result) return 0n;
-      const kind = calls[idx].router.kind;
-      if (kind === 1 || kind === 2) {
+      const kind = quoteableCalls[idx].router.kind;
+      if (kind === 1 || kind === 2 || kind === 5) {
         const tuple = res.result as readonly [bigint, bigint, number, bigint];
         return tuple[0] ?? 0n;
       }
@@ -792,6 +813,12 @@ async function batchReadMultiDexQuotes(
       }
       const arr = res.result as readonly bigint[];
       return arr[arr.length - 1] ?? 0n;
+    });
+
+    let quoteIndex = 0;
+    return calls.map((req) => {
+      if (!isRouterQuoteable(req.router)) return 0n;
+      return quoteableOutputs[quoteIndex++] ?? 0n;
     });
   } catch {
     const output: bigint[] = [];
@@ -922,6 +949,12 @@ export async function scanChainOpportunities(
   }
 
   const configuredRouters = getRoutersForChain(options.chain.key, options.extraRouters);
+  for (const router of configuredRouters) {
+    if (!isRouterQuoteable(router)) {
+      const requirement = router.kind === 3 ? 'factoryAddress' : 'quoterAddress V3';
+      warnings.push(`Router ${router.name} dilewati karena konfigurasi quote tidak lengkap: tambahkan ${requirement} yang cocok di CUSTOM_DEX_ROUTERS_JSON.`);
+    }
+  }
   const routerWhitelists: RouterWhitelistState[] = [];
 
   for (const router of configuredRouters) {
@@ -990,7 +1023,9 @@ export async function scanChainOpportunities(
   const pendingWhitelistRouters = routerWhitelists.filter((item) => item.needsArbWhitelist);
 
   // Scan Multi-DEX (V2 + V3 + Aerodrome + Curve) arbitrage quotes across 5-point Golden-Section loan tiers
-  const activeRouters = configuredRouters.filter((_, idx) => routerWhitelists[idx]?.hasBytecode);
+  const activeRouters = configuredRouters.filter(
+    (router, idx) => routerWhitelists[idx]?.hasBytecode && isRouterQuoteable(router),
+  );
   const topAssets = eligibleAssets.slice(0, maxAssetsToPair);
   const allTierCandidates: ArbitrageCandidate[] = [];
 
@@ -1232,15 +1267,16 @@ export async function scanChainOpportunities(
 
   const profitableCandidates = arbitrageCandidates.filter((item) => item.profitable);
 
-  // Scan Morpho Blue Liquidations (GraphQL + On-Chain Indexer + Pre-Liquidation Watchlist)
-  const liquidationCandidates = await scanMorphoLiquidations({
+  // Scan Morpho Blue liquidations and reconcile the pre-liquidation watchlist from GraphQL.
+  const liquidationScan = await scanMorphoLiquidations({
     chain: options.chain,
-    rpcUrl: options.rpcUrl,
-    routers: activeRouters.length > 0 ? activeRouters : configuredRouters,
+    routers: activeRouters,
     gasCostUsd: estimatedGasCostUsd,
     minProfitUsd,
     maxSlippageBps,
   });
+  warnings.push(...liquidationScan.warnings);
+  const liquidationCandidates = liquidationScan.candidates;
   const profitableLiquidations = liquidationCandidates.filter((item) => item.profitable);
 
   return {

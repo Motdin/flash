@@ -9,6 +9,7 @@ import { resolveChainWssUrl } from '../agent/ws-listener.js';
 import {
   decodeCurveIndices,
   encodeCurveIndices,
+  getRoutersForChain,
 } from '../config/dex-routers.js';
 import {
   applySlippageBps,
@@ -298,4 +299,27 @@ test('resolveChainWssUrl detects standard WSS and Base Flashblocks WSS URLs', ()
   assert.equal(resolved.wssUrl, 'wss://mainnet.flashblocks.base.org/ws');
   assert.equal(resolved.isFlashblocks, true);
   delete process.env.BASE_FLASHBLOCKS_WSS_URL;
+});
+
+
+test('custom direct V3 pool config preserves its matching QuoterV2 address', () => {
+  const originalRouters = process.env.CUSTOM_DEX_ROUTERS_JSON;
+  process.env.CUSTOM_DEX_ROUTERS_JSON = JSON.stringify({
+    customchain: [{
+      name: 'V3 direct pool',
+      address: '0x1111111111111111111111111111111111111111',
+      kind: 5,
+      v3FeeTier: 3000,
+      quoterAddress: '0x2222222222222222222222222222222222222222',
+    }],
+  });
+  try {
+    const [router] = getRoutersForChain('customchain');
+    assert.equal(router.kind, 5);
+    assert.equal(router.v3FeeTier, 3000);
+    assert.equal(router.quoterAddress?.toLowerCase(), '0x2222222222222222222222222222222222222222');
+  } finally {
+    if (originalRouters === undefined) delete process.env.CUSTOM_DEX_ROUTERS_JSON;
+    else process.env.CUSTOM_DEX_ROUTERS_JSON = originalRouters;
+  }
 });

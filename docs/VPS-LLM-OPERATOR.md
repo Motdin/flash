@@ -90,7 +90,9 @@ chmod 600 .env
 | `flashloan` | Allowed | Allowed | Blocked | Blocked | If `AUTO_BROADCAST=true` |
 | `arbitrage` | Allowed | Blocked | Allowed | Blocked | If `AUTO_BROADCAST=true` |
 | `liquidation` | Allowed | Blocked | Blocked | Allowed | If `AUTO_BROADCAST=true` |
-| `full` | Allowed | Allowed | Allowed | Allowed | If `AUTO_BROADCAST=true` |
+| `full` | Allowed | Blocked by default¹ | Allowed | Allowed | If `AUTO_BROADCAST=true` |
+
+¹ In `full` mode, set `FLASHLOAN_ON_WHITELIST=true` to explicitly opt into flashloan execution. The dedicated `flashloan` mode is itself the opt-in.
 
 ---
 
@@ -143,6 +145,8 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+The application always listens on container port `3000` (matching its healthcheck). To change the host-side port, set `WATCH_HTTP_HOST_PORT` in the repository-root `.env` or in the shell running Compose; values in `tools/.env` are container environment values and are not used for Compose port interpolation.
+
 ### Viewing & Interacting with the CLI on a VPS
 1. **Interactive Menu via SSH** (can be opened anytime even while the background daemon runs):
    ```bash
@@ -167,11 +171,11 @@ When `WATCH_HTTP_PORT=3000` (default), the built-in server binds to `0.0.0.0:300
 
 - **`GET /`**: Real-time dark-mode Web Dashboard displaying Morpho liquidity, contract allowlist status, Multi-DEX arbitrage spreads, and LLM Operator reasoning history.
 - **`GET /health`**: Lightweight JSON health check for Docker, systemd, or Uptime Kuma.
-- **`GET /api/status`**: Complete runtime state (including `wsStatuses` and `atRiskWatchlist`), chain reports, and audit log history in JSON.
+- **`GET /api/status`**: Runtime state (including `wsStatuses` and `atRiskWatchlist`), chain reports, and audit log history in JSON. The LLM API key is always redacted.
 - **`GET /api/watchlist`**: Returns the auto-indexed Morpho Blue Pre-Liquidation Watchlist (`1.00 <= healthFactor <= 1.12`) across all monitored chains (supports optional `?chain=base` filter).
 - **`POST /api/trigger`**: Triggers an immediate scan and evaluation cycle.
 - **`POST /api/mode`**: Dynamically updates `mode`, `autoBroadcast`, or `minProfitUsd` at runtime.
-  - Note: Enabling `autoBroadcast: true` over HTTP requires `OPERATOR_API_TOKEN` to be set in `tools/.env` and passed via `Authorization: Bearer <token>`.
+  - All HTTP control operations (`/api/trigger` and `/api/mode`) fail closed unless `OPERATOR_API_TOKEN` is set in `tools/.env` and passed via `Authorization: Bearer <token>`. The dashboard asks for the token when a control is used and keeps it only in page memory. Without a token, its controls are disabled. `GET /api/status` remains read-only and never includes the LLM API key.
 
 ---
 
