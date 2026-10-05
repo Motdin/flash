@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { evmChains } from '../config/chains.js';
 import type { ChainOpportunityReport } from '../morpho/dex-scanner.js';
-import { computeDynamicPriorityFee } from './executor.js';
+import { computeDynamicPriorityFee, estimateExecutionNetProfitAfterGas } from './executor.js';
+import { buildWhitelistCooldownKey } from './cooldown.js';
 import {
   evaluateDeterministically,
   evaluateWithLlmOperator,
@@ -272,6 +273,155 @@ test('Policy Guard overrides an LLM EXECUTE_FLASHLOAN choice when flashloans are
   }
 });
 
+test('LLM cannot execute an arbitrage candidate that is still on cooldown', async () => {
+  const candidate = {
+    id: 'arb-cooldown',
+    loanSymbol: 'USDC',
+    intermediateSymbol: 'WETH',
+    firstRouterName: 'Router A',
+    secondRouterName: 'Router B',
+    loanAmountUsd: 1_000,
+    spreadBps: 25,
+    grossProfitUsd: 10,
+    estimatedGasCostUsd: 1,
+    netProfitUsd: 9,
+    profitable: true,
+    readyToExecute: true,
+  } as unknown as ChainOpportunityReport['profitableCandidates'][number];
+  const report = createMockReport({
+    arbitrageCandidates: [candidate],
+    profitableCandidates: [candidate],
+  });
+  const config = loadLlmOperatorConfig({
+    mode: 'arbitrage',
+    minProfitUsd: 5,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+  });
+  const cooldowns = new Map<string, number>([['arb:arb-cooldown', Date.now() + 60_000]]);
+  const restoreFetch = stubLlmResponse({
+    action: 'EXECUTE_ARBITRAGE',
+    candidateId: 'arb-cooldown',
+    confidence: 0.95,
+    reasoning: 'Jalankan kandidat yang terlihat menguntungkan',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config, cooldowns);
+    assert.equal(decision.action, 'HOLD');
+    assert.match(decision.reasoning, /bebas cooldown/);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('LLM cannot execute a liquidation candidate that is still on cooldown', async () => {
+  const candidate = {
+    id: 'liq-cooldown',
+    borrower: '0x1111111111111111111111111111111111111111',
+    healthFactor: 0.99,
+    marketParams: { loanSymbol: 'USDC', collateralSymbol: 'WETH' },
+    repaidUsd: 1_000,
+    netProfitUsd: 25,
+    profitable: true,
+  } as unknown as NonNullable<ChainOpportunityReport['profitableLiquidations']>[number];
+  const report = createMockReport({
+    liquidationCandidates: [candidate],
+    profitableLiquidations: [candidate],
+  });
+  const config = loadLlmOperatorConfig({
+    mode: 'liquidation',
+    minProfitUsd: 5,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+  });
+  const cooldowns = new Map<string, number>([['liq:liq-cooldown', Date.now() + 60_000]]);
+  const restoreFetch = stubLlmResponse({
+    action: 'EXECUTE_LIQUIDATION',
+    candidateId: 'liq-cooldown',
+    confidence: 0.95,
+    reasoning: 'Jalankan kandidat likuidasi',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config, cooldowns);
+    assert.equal(decision.action, 'HOLD');
+    assert.match(decision.reasoning, /bebas cooldown/);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('LLM cannot repeat a whitelist sync while the same targets are on cooldown', async () => {
+  const report = createMockReport({ pendingWhitelistAssets: [pendingWhitelistAsset] });
+  const config = loadLlmOperatorConfig({
+    mode: 'full',
+    whitelistAutoSync: true,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+  });
+  const key = buildWhitelistCooldownKey(
+    'base',
+    [{ address: pendingWhitelistAsset.address, target: 'flash' }],
+    [],
+  );
+  const cooldowns = new Map<string, number>([[key, Date.now() + 60_000]]);
+  const restoreFetch = stubLlmResponse({
+    action: 'SYNC_WHITELIST',
+    confidence: 0.95,
+    reasoning: 'Sinkronkan token kembali',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config, cooldowns);
+    assert.equal(decision.action, 'HOLD');
+    assert.match(decision.reasoning, /masih dalam cooldown/);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('LLM cannot trigger a flashloan for an asset on cooldown', async () => {
+  const flashAsset = {
+    symbol: 'USDC',
+    address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const,
+    decimals: 6,
+    usdValue: 250_000,
+    priceUsd: 1,
+    balance: 250_000_000_000n,
+    formattedBalance: '250000',
+    allowedOnFlashExecutor: true,
+    allowedOnArbExecutor: true,
+    matchesPolicyTarget: true,
+    needsFlashWhitelist: false,
+    needsArbWhitelist: false,
+  };
+  const report = createMockReport({ whitelistedAssets: [flashAsset] });
+  const config = loadLlmOperatorConfig({
+    mode: 'flashloan',
+    flashloanOnWhitelist: true,
+    fastPathEnabled: false,
+    baseUrl: 'http://127.0.0.1:9/v1',
+  });
+  const cooldowns = new Map<string, number>([
+    [`flashloan:base:${flashAsset.symbol}`, Date.now() + 60_000],
+  ]);
+  const restoreFetch = stubLlmResponse({
+    action: 'EXECUTE_FLASHLOAN',
+    flashloanSymbol: 'USDC',
+    confidence: 0.9,
+    reasoning: 'Flashloan testing',
+  });
+
+  try {
+    const decision = await evaluateWithLlmOperator(report, config, cooldowns);
+    assert.equal(decision.action, 'HOLD');
+    assert.equal(decision.flashloanPlan, undefined);
+  } finally {
+    restoreFetch();
+  }
+});
+
 test('computeDynamicPriorityFee allocates profit bribe while respecting cap', () => {
   const fee = computeDynamicPriorityFee({
     baseGasPriceWei: 1_000_000_000n, // 1 gwei
@@ -285,4 +435,28 @@ test('computeDynamicPriorityFee allocates profit bribe while respecting cap', ()
 
   assert.ok(fee.maxPriorityFeePerGas > 10_000_000n);
   assert.ok(fee.maxFeePerGas > fee.maxPriorityFeePerGas);
+});
+
+
+test('live execution gas guard rejects a quote whose net profit falls below the configured minimum', () => {
+  assert.throws(
+    () => estimateExecutionNetProfitAfterGas({
+      expectedGrossProfitUsd: 50,
+      minimumProfitUsd: 5,
+      maxFeePerGas: 202_000_000_000n,
+      estimatedGasUnits: 280_000n,
+      nativePriceUsd: 2_500,
+    }),
+    /Net-profit guard/,
+  );
+
+  const safe = estimateExecutionNetProfitAfterGas({
+    expectedGrossProfitUsd: 500,
+    minimumProfitUsd: 5,
+    maxFeePerGas: 202_000_000_000n,
+    estimatedGasUnits: 280_000n,
+    nativePriceUsd: 2_500,
+  });
+  assert.ok(safe.estimatedNetProfitUsd >= 5);
+  assert.ok(safe.gasCostUsd > 80, 'cost includes a 20% gas estimate margin');
 });

@@ -22,6 +22,7 @@ import {
 import { scanMorphoBalances, type ScannedAsset } from '../morpho/scanner.js';
 import { color, renderTable, ui } from '../ui/index.js';
 import { executeOperatorDecision } from './executor.js';
+import { pruneExecutionCooldowns } from './cooldown.js';
 import {
   evaluateWithLlmOperator,
   loadLlmOperatorConfig,
@@ -34,6 +35,7 @@ import {
   type OperatorAuditEntry,
 } from './logger.js';
 import {
+  redactOperatorConfig,
   startOperatorServer,
   type OperatorRuntimeState,
 } from './server.js';
@@ -351,7 +353,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
   }
 
   const maxConsecutiveFailures = Number(process.env.MAX_CONSECUTIVE_FAILURES ?? '3');
-  const recentExecutedKeys = new Set<string>();
+  const recentExecutedKeys = new Map<string, number>();
   const runtimeState: OperatorRuntimeState = {
     startedAt: new Date().toISOString(),
     running: true,
@@ -373,6 +375,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
 
   const executeSingleCycle = async (): Promise<void> => {
     if (runtimeState.cycleRunning) return;
+    pruneExecutionCooldowns(recentExecutedKeys);
     runtimeState.cycleRunning = true;
     runtimeState.cycleCount += 1;
     const cycleNum = runtimeState.cycleCount;
@@ -579,8 +582,15 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
 
   let wsListener: WsBlockListenerHandle | undefined;
   if (!options.once && process.env.WSS_STREAM_ENABLED !== 'false') {
+    const listenerDeployments = await loadDeployments();
+    const morphoAddresses: Record<string, Address | undefined> = {};
+    for (const chain of selectedChains) {
+      const morphoAddress = deploymentFor(listenerDeployments, chain.key)?.morpho;
+      if (morphoAddress) morphoAddresses[chain.key] = getAddress(morphoAddress) as Address;
+    }
     wsListener = startMultiChainWsListeners({
       chains: selectedChains,
+      morphoAddresses,
       onChainTrigger: (_chain, _source) => {
         if (!runtimeState.cycleRunning && runtimeState.running) {
           void executeSingleCycle();
@@ -625,7 +635,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
     if (options.json) {
       console.log(
         JSON.stringify(
-          runtimeState,
+          { ...runtimeState, config: redactOperatorConfig(runtimeState.config) },
           (_k, v) => (typeof v === 'bigint' ? v.toString() : v),
           2,
         ),

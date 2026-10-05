@@ -232,7 +232,14 @@ export const DEFAULT_DEX_ROUTERS: Record<string, DexRouterConfig[]> = {
 
 export function getRoutersForChain(
   chainKey: string,
-  extraRouters?: Array<{ name?: string; address: string; feeBps?: number; kind?: RouterKindId; v3FeeTier?: number }>,
+  extraRouters?: Array<{
+    name?: string;
+    address: string;
+    feeBps?: number;
+    kind?: RouterKindId;
+    v3FeeTier?: number;
+    quoterAddress?: string;
+  }>,
 ): DexRouterConfig[] {
   const byKey = new Map<string, DexRouterConfig>();
 
@@ -252,7 +259,14 @@ export function getRoutersForChain(
     try {
       const parsed = JSON.parse(rawEnv) as Record<
         string,
-        Array<{ name?: string; address: string; feeBps?: number; kind?: RouterKindId; v3FeeTier?: number }>
+        Array<{
+          name?: string;
+          address: string;
+          feeBps?: number;
+          kind?: RouterKindId;
+          v3FeeTier?: number;
+          quoterAddress?: string;
+        }>
       >;
       for (const item of parsed[chainKey] ?? []) {
         const normalized = getAddress(item.address) as Address;
@@ -264,6 +278,7 @@ export function getRoutersForChain(
           kind: item.kind ?? 0,
           feeBps: item.feeBps ?? 30,
           ...(item.v3FeeTier !== undefined ? { v3FeeTier: item.v3FeeTier } : {}),
+          ...(item.quoterAddress ? { quoterAddress: getAddress(item.quoterAddress) as Address } : {}),
         });
       }
     } catch {
@@ -281,6 +296,7 @@ export function getRoutersForChain(
       kind: item.kind ?? 0,
       feeBps: item.feeBps ?? 30,
       ...(item.v3FeeTier !== undefined ? { v3FeeTier: item.v3FeeTier } : {}),
+      ...(item.quoterAddress ? { quoterAddress: getAddress(item.quoterAddress) as Address } : {}),
     });
   }
 

@@ -1,4 +1,5 @@
 import { parseUnits } from 'viem';
+import { buildWhitelistCooldownKey, isOnExecutionCooldown, type ExecutionCooldowns } from './cooldown.js';
 import type { RouterKindId } from '../config/dex-routers.js';
 import type { Address } from '../config/registry.js';
 import type {
@@ -362,7 +363,7 @@ function buildFlashloanPlan(
 export function evaluateDeterministically(
   report: ChainOpportunityReport,
   config: LlmOperatorConfig,
-  recentExecutedKeys: Set<string> = new Set(),
+  recentExecutedKeys: ExecutionCooldowns = new Map(),
   fallbackReason?: string,
   isFastPath = false,
 ): OperatorDecision {
@@ -394,14 +395,14 @@ export function evaluateDeterministically(
   const bestLiquidation = (report.profitableLiquidations ?? []).find(
     (liq) =>
       liq.netProfitUsd >= config.minProfitUsd &&
-      !recentExecutedKeys.has(`liq:${liq.id}`),
+      !isOnExecutionCooldown(recentExecutedKeys, `liq:${liq.id}`),
   );
 
   // Priority 2: Profitable Multi-DEX Arbitrage
   const bestArbitrage = report.profitableCandidates.find(
     (cand) =>
       cand.netProfitUsd >= config.minProfitUsd &&
-      !recentExecutedKeys.has(`arb:${cand.id}`),
+      !isOnExecutionCooldown(recentExecutedKeys, `arb:${cand.id}`),
   );
 
   // Choose whichever yields higher net profit between Liquidation and Arbitrage
@@ -457,13 +458,21 @@ export function evaluateDeterministically(
   // Priority 3: Pending Whitelist Sync (Token or Router)
   const hasPendingWhitelist =
     report.pendingWhitelistAssets.length > 0 || report.pendingWhitelistRouters.length > 0;
-  const whitelistCooldownKey = `whitelist:${report.chain.key}:${report.pendingWhitelistAssets.map((a) => a.symbol).join(',')}`;
+  const pendingWhitelistPlan = buildWhitelistPlan(
+    report.pendingWhitelistAssets,
+    report.pendingWhitelistRouters,
+  );
+  const whitelistCooldownKey = buildWhitelistCooldownKey(
+    report.chain.key,
+    pendingWhitelistPlan.tokensToAllow,
+    pendingWhitelistPlan.routersToAllow,
+  );
 
   if (
     config.whitelistAutoSync &&
     hasPendingWhitelist &&
     isActionAllowedByMode('SYNC_WHITELIST', config.mode) &&
-    !recentExecutedKeys.has(whitelistCooldownKey)
+    !isOnExecutionCooldown(recentExecutedKeys, whitelistCooldownKey)
   ) {
     const tokenSymbols = report.pendingWhitelistAssets.map((a) => a.symbol).join(', ');
     const routerNames = report.pendingWhitelistRouters.map((r) => r.name).join(', ');
@@ -477,7 +486,7 @@ export function evaluateDeterministically(
         `. Menjalankan sinkronisasi allowlist otomatis.`,
       chain: report.chain.key,
       blockNumber: report.blockNumber.toString(),
-      whitelistPlan: buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters),
+      whitelistPlan: pendingWhitelistPlan,
       riskAssessment: { level: 'LOW', checksPassed, warnings },
       source: sourceLabel,
       model: isFastPath ? 'fast-path-engine-v2' : 'deterministic-guard-v1',
@@ -491,7 +500,7 @@ export function evaluateDeterministically(
     (asset) =>
       asset.allowedOnFlashExecutor &&
       asset.balance > 0n &&
-      !recentExecutedKeys.has(`flashloan:${report.chain.key}:${asset.symbol}`),
+      !isOnExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${asset.symbol}`),
   );
 
   if (
@@ -562,7 +571,7 @@ function extractJsonObject(rawText: string): Record<string, unknown> {
 export async function evaluateWithLlmOperator(
   report: ChainOpportunityReport,
   config: LlmOperatorConfig,
-  recentExecutedKeys: Set<string> = new Set(),
+  recentExecutedKeys: ExecutionCooldowns = new Map(),
 ): Promise<OperatorDecision> {
   const startTime = Date.now();
 
@@ -622,7 +631,7 @@ export async function evaluateWithLlmOperator(
       usdValue: Math.round(a.usdValue ?? 0),
       allowedOnFlashExecutor: a.allowedOnFlashExecutor,
       allowedOnArbExecutor: a.allowedOnArbExecutor,
-      onCooldown: recentExecutedKeys.has(`flashloan:${report.chain.key}:${a.symbol}`),
+      onCooldown: isOnExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${a.symbol}`),
     })),
     pendingWhitelistAssets: report.pendingWhitelistAssets.map((a) => ({
       symbol: a.symbol,
@@ -649,7 +658,7 @@ export async function evaluateWithLlmOperator(
       netProfitUsd: Number(c.netProfitUsd.toFixed(4)),
       profitable: c.profitable,
       readyToExecute: c.readyToExecute,
-      onCooldown: recentExecutedKeys.has(`arb:${c.id}`),
+      onCooldown: isOnExecutionCooldown(recentExecutedKeys, `arb:${c.id}`),
     })),
     liquidationCandidates: (report.liquidationCandidates ?? []).slice(0, 5).map((l) => ({
       id: l.id,
@@ -660,7 +669,7 @@ export async function evaluateWithLlmOperator(
       repaidUsd: Number(l.repaidUsd.toFixed(2)),
       netProfitUsd: Number(l.netProfitUsd.toFixed(4)),
       profitable: l.profitable,
-      onCooldown: recentExecutedKeys.has(`liq:${l.id}`),
+      onCooldown: isOnExecutionCooldown(recentExecutedKeys, `liq:${l.id}`),
     })),
   };
 
@@ -768,15 +777,19 @@ Format output WAJIB JSON object tanpa markdown tambahan:
 
     if (rawAction === 'EXECUTE_LIQUIDATION') {
       const requestedId = parsed.candidateId ? String(parsed.candidateId) : undefined;
+      const eligibleLiquidations = (report.profitableLiquidations ?? []).filter(
+        (candidate) =>
+          candidate.netProfitUsd >= config.minProfitUsd &&
+          !isOnExecutionCooldown(recentExecutedKeys, `liq:${candidate.id}`),
+      );
       const liqCandidate =
-        (report.profitableLiquidations ?? []).find((l) => l.id === requestedId) ??
-        (report.profitableLiquidations ?? []).find((l) => l.netProfitUsd >= config.minProfitUsd);
+        eligibleLiquidations.find((candidate) => candidate.id === requestedId) ?? eligibleLiquidations[0];
 
-      if (!liqCandidate || liqCandidate.netProfitUsd < config.minProfitUsd) {
+      if (!liqCandidate) {
         return {
           action: 'HOLD',
           confidence,
-          reasoning: `[Guard Override] LLM memilih EXECUTE_LIQUIDATION namun tidak ada posisi yang memenuhi minProfitUsd ($${config.minProfitUsd}).`,
+          reasoning: `[Guard Override] LLM memilih EXECUTE_LIQUIDATION namun tidak ada posisi yang memenuhi minProfitUsd ($${config.minProfitUsd}) dan bebas cooldown.`,
           chain: report.chain.key,
           blockNumber: report.blockNumber.toString(),
           riskAssessment: { level: 'MEDIUM', checksPassed, warnings },
@@ -804,15 +817,19 @@ Format output WAJIB JSON object tanpa markdown tambahan:
 
     if (rawAction === 'EXECUTE_ARBITRAGE') {
       const requestedId = parsed.candidateId ? String(parsed.candidateId) : undefined;
+      const eligibleCandidates = report.profitableCandidates.filter(
+        (item) =>
+          item.netProfitUsd >= config.minProfitUsd &&
+          !isOnExecutionCooldown(recentExecutedKeys, `arb:${item.id}`),
+      );
       const candidate =
-        report.profitableCandidates.find((c) => c.id === requestedId) ??
-        report.profitableCandidates.find((c) => c.netProfitUsd >= config.minProfitUsd);
+        eligibleCandidates.find((item) => item.id === requestedId) ?? eligibleCandidates[0];
 
-      if (!candidate || candidate.netProfitUsd < config.minProfitUsd) {
+      if (!candidate) {
         return {
           action: 'HOLD',
           confidence,
-          reasoning: `[Guard Override] LLM memilih EXECUTE_ARBITRAGE tetapi tidak ada kandidat on-chain yang memenuhi minProfitUsd ($${config.minProfitUsd}). Catatan LLM: ${reasoning}`,
+          reasoning: `[Guard Override] LLM memilih EXECUTE_ARBITRAGE tetapi tidak ada kandidat on-chain yang memenuhi minProfitUsd ($${config.minProfitUsd}) dan bebas cooldown. Catatan LLM: ${reasoning}`,
           chain: report.chain.key,
           blockNumber: report.blockNumber.toString(),
           riskAssessment: {
@@ -883,13 +900,37 @@ Format output WAJIB JSON object tanpa markdown tambahan:
         };
       }
 
+      const whitelistPlan = buildWhitelistPlan(
+        report.pendingWhitelistAssets,
+        report.pendingWhitelistRouters,
+      );
+      const whitelistKey = buildWhitelistCooldownKey(
+        report.chain.key,
+        whitelistPlan.tokensToAllow,
+        whitelistPlan.routersToAllow,
+      );
+      if (isOnExecutionCooldown(recentExecutedKeys, whitelistKey)) {
+        return {
+          action: 'HOLD',
+          confidence,
+          reasoning: `[Guard Override] Sinkronisasi whitelist untuk target ini masih dalam cooldown. Catatan LLM: ${reasoning}`,
+          chain: report.chain.key,
+          blockNumber: report.blockNumber.toString(),
+          riskAssessment: { level: 'LOW', checksPassed, warnings },
+          source: 'llm',
+          model: config.model,
+          latencyMs: Date.now() - startTime,
+          timestamp: new Date().toISOString(),
+        };
+      }
+
       return {
         action: 'SYNC_WHITELIST',
         confidence,
         reasoning,
         chain: report.chain.key,
         blockNumber: report.blockNumber.toString(),
-        whitelistPlan: buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters),
+        whitelistPlan,
         riskAssessment: { level: riskLevel, checksPassed, warnings },
         source: 'llm',
         model: config.model,
@@ -923,11 +964,15 @@ Format output WAJIB JSON object tanpa markdown tambahan:
       }
 
       const requestedSymbol = parsed.flashloanSymbol ? String(parsed.flashloanSymbol).toUpperCase() : undefined;
+      const eligibleFlashloanAssets = report.whitelistedAssets.filter(
+        (asset) =>
+          asset.allowedOnFlashExecutor &&
+          asset.balance > 0n &&
+          !isOnExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${asset.symbol}`),
+      );
       const asset =
-        report.whitelistedAssets.find(
-          (a) => a.allowedOnFlashExecutor && a.symbol.toUpperCase() === requestedSymbol,
-        ) ??
-        report.whitelistedAssets.find((a) => a.allowedOnFlashExecutor && a.balance > 0n);
+        eligibleFlashloanAssets.find((item) => item.symbol.toUpperCase() === requestedSymbol) ??
+        eligibleFlashloanAssets[0];
 
       if (!asset) {
         return {

@@ -5,7 +5,8 @@ import type {
   ArbitrageExecutionPlan,
 } from './llm-operator.js';
 import type { SwapHopStepQuote } from '../morpho/dex-scanner.js';
-import { resolveAutoAllowlistTargets } from './executor.js';
+import { isAutomaticAllowlistBlocked, resolveAutoAllowlistTargets } from './executor.js';
+import { loadLlmOperatorConfig } from './llm-operator.js';
 
 const TOKEN_A = '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' as Address;
 const TOKEN_B = '0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' as Address;
@@ -164,4 +165,26 @@ test('empty steps array falls back to the 2-hop field set', () => {
 
   assert.deepEqual(tokens, [TOKEN_A, TOKEN_B]);
   assert.deepEqual(routers, [ROUTER_1, ROUTER_2]);
+});
+
+
+test('WHITELIST_AUTO_SYNC=false blocks SYNC_WHITELIST and arbitrage auto-allowlisting', () => {
+  const config = loadLlmOperatorConfig({ whitelistAutoSync: false });
+  const syncDecision = { action: 'SYNC_WHITELIST' } as const;
+  const arbDecision = {
+    action: 'EXECUTE_ARBITRAGE',
+    arbitragePlan: makePlan({ autoAllowlistBeforeExec: true }),
+  } as const;
+  const preWhitelistedArbDecision = {
+    action: 'EXECUTE_ARBITRAGE',
+    arbitragePlan: makePlan({ autoAllowlistBeforeExec: false }),
+  } as const;
+
+  assert.equal(isAutomaticAllowlistBlocked(syncDecision as never, config), true);
+  assert.equal(isAutomaticAllowlistBlocked(arbDecision as never, config), true);
+  assert.equal(isAutomaticAllowlistBlocked(preWhitelistedArbDecision as never, config), false);
+  assert.equal(
+    isAutomaticAllowlistBlocked(syncDecision as never, loadLlmOperatorConfig({ whitelistAutoSync: true })),
+    false,
+  );
 });

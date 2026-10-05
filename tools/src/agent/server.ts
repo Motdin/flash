@@ -40,12 +40,23 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload, serializeBigInt, 2);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'Content-Type, Authorization',
     'cache-control': 'no-store',
   });
   res.end(body);
+}
+
+export function redactOperatorConfig(config: LlmOperatorConfig): Omit<LlmOperatorConfig, 'apiKey'> & {
+  apiKeyConfigured: boolean;
+} {
+  const { apiKey, ...publicConfig } = config;
+  return { ...publicConfig, apiKeyConfigured: Boolean(apiKey) };
+}
+
+function isAuthorized(req: IncomingMessage): boolean {
+  const expectedToken = process.env.OPERATOR_API_TOKEN?.trim();
+  if (!expectedToken) return false;
+  const authHeader = req.headers.authorization ?? '';
+  return authHeader === `Bearer ${expectedToken}`;
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -56,13 +67,6 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) return {};
   return JSON.parse(raw) as Record<string, unknown>;
-}
-
-function isAuthorized(req: IncomingMessage): boolean {
-  const expectedToken = process.env.OPERATOR_API_TOKEN;
-  if (!expectedToken) return true;
-  const authHeader = req.headers.authorization ?? '';
-  return authHeader === `Bearer ${expectedToken}`;
 }
 
 function renderDashboardHtml(): string {
@@ -224,12 +228,14 @@ function renderDashboardHtml(): string {
             <option value="whitelist-only">whitelist-only</option>
             <option value="flashloan">flashloan</option>
             <option value="arbitrage">arbitrage</option>
+            <option value="liquidation">liquidation</option>
             <option value="full">full (Auto Whitelist + Arb + Flash)</option>
           </select>
         </label>
         <button id="broadcastBtn" onclick="toggleBroadcast()">Broadcast: OFF</button>
         <button class="primary" id="triggerBtn" onclick="triggerCycle()">↻ Scan & Evaluasi Sekarang</button>
       </div>
+      <p id="controlAuthNotice" style="flex-basis:100%;font-size:0.78rem;color:var(--yellow);" hidden></p>
     </header>
 
     <div class="kpi-grid">
@@ -316,6 +322,44 @@ function renderDashboardHtml(): string {
 
   <script>
     let currentState = null;
+    let operatorApiToken = null;
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      })[char]);
+    }
+
+    async function postControl(path, payload) {
+      if (!operatorApiToken) {
+        const token = window.prompt('Masukkan OPERATOR_API_TOKEN untuk kontrol operator:');
+        if (!token) return false;
+        operatorApiToken = token.trim();
+      }
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + operatorApiToken,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (res.status === 401) {
+        operatorApiToken = null;
+        window.alert('Token operator tidak valid atau OPERATOR_API_TOKEN belum dikonfigurasi.');
+        return false;
+      }
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({}));
+        window.alert(error.error || 'Permintaan kontrol gagal.');
+        return false;
+      }
+      return true;
+    }
 
     function actionBadge(action) {
       if (action === 'EXECUTE_ARBITRAGE') return '<span class="badge badge-green">EXECUTE_ARBITRAGE</span>';
@@ -341,7 +385,7 @@ function renderDashboardHtml(): string {
         ? '<span class="badge badge-cyan">SCANNING...</span>'
         : '<span class="badge badge-green">ACTIVE / WATCHING</span>';
       document.getElementById('kpiMode').innerHTML =
-        '<span class="badge badge-purple">' + data.config.mode + '</span>';
+        '<span class="badge badge-purple">' + escapeHtml(data.config.mode) + '</span>';
       document.getElementById('kpiModel').textContent = data.config.model || 'deterministic';
       document.getElementById('kpiCycles').textContent = String(data.cycleCount);
       document.getElementById('kpiTargets').textContent =
@@ -352,7 +396,17 @@ function renderDashboardHtml(): string {
         modeSelect.value = data.config.mode;
       }
 
+      const controlsAvailable = Boolean(data.apiControlsAvailable);
+      const controlNotice = document.getElementById('controlAuthNotice');
+      controlNotice.hidden = controlsAvailable;
+      controlNotice.textContent = controlsAvailable
+        ? ''
+        : 'Kontrol HTTP nonaktif: set OPERATOR_API_TOKEN di tools/.env lalu mulai ulang daemon.';
       const broadcastBtn = document.getElementById('broadcastBtn');
+      const triggerBtn = document.getElementById('triggerBtn');
+      modeSelect.disabled = !controlsAvailable;
+      broadcastBtn.disabled = !controlsAvailable;
+      triggerBtn.disabled = !controlsAvailable;
       broadcastBtn.textContent = 'Broadcast: ' + (data.config.autoBroadcast ? 'ON (LIVE)' : 'OFF (SIMULASI)');
       broadcastBtn.className = data.config.autoBroadcast ? 'badge-red' : '';
 
@@ -365,8 +419,8 @@ function renderDashboardHtml(): string {
         for (const t of (rep.tokenWhitelists || []).slice(0, 8)) {
           wlRows.push(
             '<tr>' +
-              '<td><strong>' + rep.chain.name + '</strong><br/><span style="font-size:0.74rem;color:var(--muted);">Block ' + rep.blockNumber + '</span></td>' +
-              '<td class="mono"><strong>' + t.symbol + '</strong></td>' +
+              '<td><strong>' + escapeHtml(rep.chain.name) + '</strong><br/><span style="font-size:0.74rem;color:var(--muted);">Block ' + rep.blockNumber + '</span></td>' +
+              '<td class="mono"><strong>' + escapeHtml(t.symbol) + '</strong></td>' +
               '<td class="mono">$' + Math.round(t.usdValue || 0).toLocaleString() + '</td>' +
               '<td>' + (t.allowedOnFlashExecutor ? '<span class="badge badge-green">WHITELISTED</span>' : '<span class="badge badge-yellow">PENDING</span>') + '</td>' +
               '<td>' + (rep.arbExecutor ? (t.allowedOnArbExecutor ? '<span class="badge badge-green">WHITELISTED</span>' : '<span class="badge badge-yellow">PENDING</span>') : '<span style="color:var(--muted);font-size:0.75rem;">No Arb Contract</span>') + '</td>' +
@@ -386,8 +440,8 @@ function renderDashboardHtml(): string {
           const netColor = c.netProfitUsd >= data.config.minProfitUsd ? 'var(--green)' : (c.netProfitUsd > 0 ? 'var(--yellow)' : 'var(--muted)');
           arbRows.push(
             '<tr>' +
-              '<td><strong>' + rep.chain.name + '</strong><br/><span class="mono" style="font-size:0.78rem;">' + c.loanSymbol + ' → ' + c.intermediateSymbol + '</span></td>' +
-              '<td style="font-size:0.8rem;">' + c.firstRouterName + '<br/>→ ' + c.secondRouterName + '</td>' +
+              '<td><strong>' + escapeHtml(rep.chain.name) + '</strong><br/><span class="mono" style="font-size:0.78rem;">' + escapeHtml(c.loanSymbol) + ' → ' + escapeHtml(c.intermediateSymbol) + '</span></td>' +
+              '<td style="font-size:0.8rem;">' + escapeHtml(c.firstRouterName) + '<br/>→ ' + escapeHtml(c.secondRouterName) + '</td>' +
               '<td class="mono">' + c.spreadBps + ' bps</td>' +
               '<td class="mono" style="color:' + netColor + ';font-weight:600;">$' + Number(c.netProfitUsd).toFixed(2) + '</td>' +
               '<td>' + (c.profitable ? '<span class="badge badge-green">PROFITABLE</span>' : '<span class="badge badge-yellow">MONITOR</span>') + '</td>' +
@@ -409,8 +463,8 @@ function renderDashboardHtml(): string {
         if (errs.length > 0) {
           document.getElementById('historyContainer').innerHTML = errs.map((er) =>
             '<div class="decision-item">' +
-              '<div class="decision-header"><span class="badge badge-red">RPC / SCAN WARNING (' + er.chain + ')</span><span>' + new Date(er.timestamp).toLocaleTimeString() + '</span></div>' +
-              '<div class="decision-reason mono">' + er.message + '</div>' +
+              '<div class="decision-header"><span class="badge badge-red">RPC / SCAN WARNING (' + escapeHtml(er.chain) + ')</span><span>' + new Date(er.timestamp).toLocaleTimeString() + '</span></div>' +
+              '<div class="decision-reason mono">' + escapeHtml(er.message) + '</div>' +
             '</div>'
           ).join('');
         }
@@ -418,11 +472,11 @@ function renderDashboardHtml(): string {
         document.getElementById('historyContainer').innerHTML = history.slice(0, 12).map((item) =>
           '<div class="decision-item">' +
             '<div class="decision-header">' +
-              '<div>' + actionBadge(item.decision.action) + ' <strong style="margin-left:8px;">' + item.chain.toUpperCase() + '</strong> <span style="color:var(--muted);margin-left:6px;">Block ' + item.blockNumber + ' • Gas ' + Number(item.gasPriceGwei).toFixed(3) + ' gwei</span></div>' +
-              '<div style="color:var(--muted);">' + item.decision.source + ' (' + Math.round(item.decision.confidence * 100) + '%) • ' + new Date(item.timestamp).toLocaleTimeString() + '</div>' +
+              '<div>' + actionBadge(item.decision.action) + ' <strong style="margin-left:8px;">' + escapeHtml(item.chain).toUpperCase() + '</strong> <span style="color:var(--muted);margin-left:6px;">Block ' + item.blockNumber + ' • Gas ' + Number(item.gasPriceGwei).toFixed(3) + ' gwei</span></div>' +
+              '<div style="color:var(--muted);">' + escapeHtml(item.decision.source) + ' (' + Math.round(item.decision.confidence * 100) + '%) • ' + new Date(item.timestamp).toLocaleTimeString() + '</div>' +
             '</div>' +
-            '<div class="decision-reason">' + item.decision.reasoning + '</div>' +
-            '<div class="decision-outcome">Outcome: ' + item.outcome.summary + '</div>' +
+            '<div class="decision-reason">' + escapeHtml(item.decision.reasoning) + '</div>' +
+            '<div class="decision-outcome">Outcome: ' + escapeHtml(item.outcome.summary) + '</div>' +
           '</div>'
         ).join('');
       }
@@ -433,33 +487,22 @@ function renderDashboardHtml(): string {
       btn.disabled = true;
       btn.textContent = '↻ Memindai...';
       try {
-        await fetch('/api/trigger', { method: 'POST' });
-        await fetchStatus();
+        if (await postControl('/api/trigger', {})) await fetchStatus();
       } finally {
-        btn.disabled = false;
+        btn.disabled = !currentState?.apiControlsAvailable;
         btn.textContent = '↻ Scan & Evaluasi Sekarang';
       }
     }
 
     async function changeMode() {
       const mode = document.getElementById('modeSelect').value;
-      await fetch('/api/mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode }),
-      });
-      await fetchStatus();
+      if (await postControl('/api/mode', { mode })) await fetchStatus();
     }
 
     async function toggleBroadcast() {
       if (!currentState) return;
       const next = !currentState.config.autoBroadcast;
-      await fetch('/api/mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ autoBroadcast: next }),
-      });
-      await fetchStatus();
+      if (await postControl('/api/mode', { autoBroadcast: next })) await fetchStatus();
     }
 
     fetchStatus();
@@ -478,11 +521,7 @@ export async function startOperatorServer(
     const url = new URL(req.url ?? '/', 'http://localhost');
 
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'Content-Type, Authorization',
-      });
+      res.writeHead(204, { 'cache-control': 'no-store' });
       res.end();
       return;
     }
@@ -506,8 +545,13 @@ export async function startOperatorServer(
 
     if (req.method === 'GET' && url.pathname === '/api/status') {
       const state = handlers.getState();
-      state.atRiskWatchlist = getAtRiskWatchlist();
-      sendJson(res, 200, state);
+      const { config, ...publicState } = state;
+      sendJson(res, 200, {
+        ...publicState,
+        config: redactOperatorConfig(config),
+        atRiskWatchlist: getAtRiskWatchlist(),
+        apiControlsAvailable: Boolean(process.env.OPERATOR_API_TOKEN?.trim()),
+      });
       return;
     }
 
@@ -552,20 +596,13 @@ export async function startOperatorServer(
           }
         }
         if (typeof body.autoBroadcast === 'boolean') {
-          if (body.autoBroadcast === true && !process.env.OPERATOR_API_TOKEN) {
-            sendJson(res, 403, {
-              error:
-                'Keamanan Produksi: Set OPERATOR_API_TOKEN di tools/.env untuk mengaktifkan live broadcast melalui HTTP API, atau aktifkan langsung lewat AUTO_BROADCAST=true di .env / flag --broadcast.',
-            });
-            return;
-          }
           patch.autoBroadcast = body.autoBroadcast;
         }
         if (typeof body.minProfitUsd === 'number' && body.minProfitUsd >= 0) {
           patch.minProfitUsd = body.minProfitUsd;
         }
         handlers.updateConfig(patch);
-        sendJson(res, 200, { ok: true, config: handlers.getState().config });
+        sendJson(res, 200, { ok: true, config: redactOperatorConfig(handlers.getState().config) });
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
