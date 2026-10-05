@@ -24,7 +24,7 @@ contract ExecutorForkTest {
     uint256 private constant ARBITRUM_CHAIN_ID = 42161;
     uint256 private constant ONE_USDC = 1e6;
 
-    address private constant BASE_MORPHO = 0xBbBBBBbBBbB9cc5E90E3B3AF64BdAF62c37EfFCB;
+    address private constant BASE_MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
     address private constant BASE_USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address private constant BASE_V2_ROUTER = 0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24;
 
