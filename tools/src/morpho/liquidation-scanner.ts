@@ -283,29 +283,55 @@ export function evaluateLiquidationCandidate(params: {
   };
 }
 
+const POSITION_PAGE_SIZE = 100;
+const configuredMaxPositionPages = () => {
+  const configured = Number(process.env.MORPHO_LIQUIDATION_MAX_PAGES ?? 50);
+  return Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : 50;
+};
+type MorphoApiPosition = { user?: { address?: string }; market?: { uniqueKey?: string } };
+type MorphoPositionsPageResult = { items: MorphoApiPosition[]; complete: boolean };
 const liquidationPositionsQuery = `
-  query ScanLiquidatableAndAtRiskPositions($chainId: Int!) {
-    marketPositions(
-      first: 100
-      where: { chainId_in: [$chainId], healthFactor_lte: 1.12, borrowAssetsUsd_gte: 100 }
-    ) {
-      items {
-        healthFactor
-        borrowAssetsUsd
-        collateralUsd
-        user { address }
-        market {
-          uniqueKey
-          lltv
-          oracleAddress
-          irmAddress
-          loanAsset { address symbol decimals priceUsd }
-          collateralAsset { address symbol decimals priceUsd }
-        }
-      }
+  query DiscoverBorrowers($chainId: Int!, $first: Int!, $skip: Int!) {
+    marketPositions(first: $first, skip: $skip,
+      where: { chainId_in: [$chainId], healthFactor_lte: 1.12, borrowAssetsUsd_gte: 100 }) {
+      items { user { address } market { uniqueKey } }
     }
   }
 `;
+
+export async function fetchLiquidationPositionPages(
+  endpoint: string,
+  chainId: number,
+): Promise<MorphoPositionsPageResult> {
+  const maxPages = configuredMaxPositionPages();
+  const items: MorphoApiPosition[] = [];
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query: liquidationPositionsQuery,
+        variables: { chainId, first: POSITION_PAGE_SIZE, skip: page * POSITION_PAGE_SIZE },
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`Morpho API HTTP ${res.status}`);
+    const body = await res.json() as {
+      errors?: Array<{ message?: string }>;
+      data?: { marketPositions?: { items?: MorphoApiPosition[] } };
+    };
+    if (body.errors?.length) {
+      throw new Error(body.errors.map((error) => error.message ?? 'GraphQL error').join('; '));
+    }
+    const pageItems = body.data?.marketPositions?.items;
+    if (!Array.isArray(pageItems)) throw new Error('Morpho API tidak mengembalikan marketPositions.items');
+    items.push(...pageItems);
+    if (pageItems.length < POSITION_PAGE_SIZE) return { items, complete: true };
+  }
+
+  return { items, complete: false };
+}
 
 const borrowEventAbi = parseAbiItem(
   'event Borrow(bytes32 indexed id, address caller, address indexed onBehalf, address indexed receiver, uint256 assets, uint256 shares)',
@@ -350,156 +376,66 @@ export async function discoverOnChainMorphoBorrowers(params: {
   }
 }
 
+export type LiquidationScanResult = { candidates: LiquidationCandidate[]; warnings: string[] };
+
 export async function scanMorphoLiquidations(params: {
-  chain: EvmChainConfig;
-  rpcUrl?: string;
-  assets?: ScannedAsset[];
-  routers: DexRouterConfig[];
-  gasCostUsd: number;
-  minProfitUsd: number;
-  maxSlippageBps: number;
-}): Promise<LiquidationCandidate[]> {
+  chain: EvmChainConfig; rpcUrl?: string; assets?: ScannedAsset[];
+  routers: DexRouterConfig[]; gasCostUsd: number; minProfitUsd: number; maxSlippageBps: number;
+}): Promise<LiquidationScanResult> {
   const { chain, rpcUrl, routers, gasCostUsd, minProfitUsd, maxSlippageBps } = params;
-  if (routers.length === 0) return [];
-  // Pick the lowest-fee router for collateral liquidation swap
-  const sortedRouters = [...routers].sort((a, b) => a.feeBps - b.feeBps);
-  const bestRouter = sortedRouters[0];
-
   const candidates: LiquidationCandidate[] = [];
+  const warnings: string[] = [];
+  if (!rpcUrl || !routers.length) return { candidates, warnings: ['Liquidation scan requires RPC and configured routers'] };
   const discovered = new Map<string, { marketId: `0x${string}`; borrower: Address }>();
-  const discover = (marketId: `0x${string}`, borrower: Address) => discovered.set(`${marketId}:${borrower.toLowerCase()}`, { marketId, borrower });
-
-  // 1. Check custom / manual liquidation candidates from MORPHO_LIQUIDATION_CANDIDATES_JSON if configured
-  const rawManual = process.env.MORPHO_LIQUIDATION_CANDIDATES_JSON;
-  if (rawManual) {
+  const discover = (marketId: string, borrower: string) => {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(marketId)) throw new Error('Invalid market ID');
+    const address = getAddress(borrower) as Address;
+    const id = marketId.toLowerCase() as `0x${string}`;
+    discovered.set(`${id}:${address.toLowerCase()}`, { marketId: id, borrower: address });
+  };
+  // Indexer/manual input only provides IDs, never health/profit/prices used for execution.
+  if (process.env.MORPHO_LIQUIDATION_CANDIDATES_JSON) {
     try {
-      const parsed = JSON.parse(rawManual) as Record<
-        string,
-        Array<{
-          borrower: string;
-          borrowUsd: number;
-          collateralUsd: number;
-          market: Omit<MorphoMarketParamsConfig, 'lltv'> & { lltv: string };
-        }>
-      >;
-      for (const item of parsed[chain.key] ?? []) {
-        const marketConfig: MorphoMarketParamsConfig = {
-          ...item.market,
-          loanToken: getAddress(item.market.loanToken) as Address,
-          collateralToken: getAddress(item.market.collateralToken) as Address,
-          oracle: getAddress(item.market.oracle) as Address,
-          irm: getAddress(item.market.irm) as Address,
-          lltv: BigInt(item.market.lltv),
-        };
-        discover(marketConfig.marketId, getAddress(item.borrower) as Address);
-      }
-    } catch {
-      // Ignore malformed manual JSON
-    }
+      const seeds = JSON.parse(process.env.MORPHO_LIQUIDATION_CANDIDATES_JSON);
+      for (const item of seeds[chain.key] ?? []) discover(item.market.marketId, item.borrower);
+    } catch { warnings.push('Invalid manual liquidation seed configuration'); }
   }
-
-  // 2. Query Morpho Blue GraphQL API (Indexes both liquidatable < 1.0 and at-risk 1.00..1.12 positions)
-  for (const apiEndpoint of MORPHO_APIS) {
+  let indexed = false;
+  for (const endpoint of MORPHO_APIS) {
     try {
-      const res = await fetch(apiEndpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          query: liquidationPositionsQuery,
-          variables: { chainId: chain.chainId },
-        }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) continue;
-      const body = (await res.json()) as {
-        data?: {
-          marketPositions?: {
-            items?: Array<{
-              healthFactor?: number;
-              borrowAssetsUsd?: number;
-              collateralUsd?: number;
-              user?: { address?: string };
-              market?: {
-                uniqueKey?: string;
-                lltv?: string;
-                oracleAddress?: string;
-                irmAddress?: string;
-                loanAsset?: { address?: string; symbol?: string; decimals?: number; priceUsd?: number };
-                collateralAsset?: { address?: string; symbol?: string; decimals?: number; priceUsd?: number };
-              };
-            }>;
-          };
-        };
-      };
-
-      const items = body.data?.marketPositions?.items;
-      if (!items) continue;
-
-      for (const item of items) {
-        const m = item.market;
-        if (
-          !item.user?.address ||
-          !m?.uniqueKey ||
-          !m.loanAsset?.address ||
-          !m.collateralAsset?.address ||
-          !m.oracleAddress ||
-          !m.irmAddress
-        ) {
-          continue;
-        }
-
-        const marketConfig: MorphoMarketParamsConfig = {
-          marketId: m.uniqueKey as `0x${string}`,
-          loanToken: getAddress(m.loanAsset.address) as Address,
-          loanSymbol: m.loanAsset.symbol ?? 'LOAN',
-          loanDecimals: m.loanAsset.decimals ?? 18,
-          loanPriceUsd: m.loanAsset.priceUsd ?? 1,
-          collateralToken: getAddress(m.collateralAsset.address) as Address,
-          collateralSymbol: m.collateralAsset.symbol ?? 'COLL',
-          collateralDecimals: m.collateralAsset.decimals ?? 18,
-          collateralPriceUsd: m.collateralAsset.priceUsd ?? 1,
-          oracle: getAddress(m.oracleAddress) as Address,
-          irm: getAddress(m.irmAddress) as Address,
-          lltv: BigInt(m.lltv ?? '860000000000000000'),
-        };
-
-        discover(marketConfig.marketId, getAddress(item.user.address) as Address);
+      const page = await fetchLiquidationPositionPages(endpoint, chain.chainId);
+      for (const item of page.items) {
+        try { if (item.market?.uniqueKey && item.user?.address) discover(item.market.uniqueKey, item.user.address); }
+        catch { warnings.push('Invalid indexer liquidation seed skipped'); }
       }
+      if (!page.complete) warnings.push('Liquidation pagination cap reached; discovery may be incomplete');
+      indexed = true;
       break;
-    } catch {
-      // Try next GraphQL endpoint
-    }
+    } catch { /* try the next indexer; previous borrowers still get on-chain checks */ }
   }
-
-  // 3. Optionally index recent on-chain Borrow events if RPC is provided
-  if (rpcUrl && process.env.ONCHAIN_BORROW_INDEXER_ENABLED === 'true') {
+  if (!indexed) warnings.push('Liquidation indexers unavailable; only prior/manual/event seeds checked');
+  if (process.env.ONCHAIN_BORROW_INDEXER_ENABLED === 'true') {
     for (const entry of await discoverOnChainMorphoBorrowers({ chain, rpcUrl })) discover(entry.marketId, entry.borrower);
   }
-
-  // Recheck previous borrowers as well, including positions no longer returned by the API.
   for (const entry of getAtRiskWatchlist(chain.key)) discover(entry.marketId, entry.borrower);
-  if (rpcUrl) {
-    const client = createPublicClient({ transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 0 }) });
-    if (await client.getChainId() !== chain.chainId) throw new Error('Liquidation RPC chain mismatch');
-    const morpho = await morphoForChain(chain.key);
-    for (const entry of discovered.values()) {
+  const client = createPublicClient({ transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 0 }) });
+  if (await client.getChainId() !== chain.chainId) throw new Error('Liquidation RPC chain mismatch');
+  const morpho = await morphoForChain(chain.key);
+  let failed = 0;
+  const seeds = [...discovered.values()];
+  for (let i = 0; i < seeds.length; i += 8) {
+    await Promise.all(seeds.slice(i, i + 8).map(async entry => {
       try {
         const candidate = await quoteVerifiedLiquidation({ client, morpho, chainKey: chain.key,
           ...entry, assets: params.assets ?? [], routers, gasCostUsd, minProfitUsd, maxSlippageBps });
         if (candidate) candidates.push(candidate);
-      } catch {
-        // No verified position / fresh prices / executable quote means no execution candidate.
-      }
-    }
+      } catch { failed++; }
+    }));
   }
-
-  // Also persist an empty list after positions recover; never resurrect stale entries on restart.
-  {
-    await persistWatchlistToDisk();
-  }
-
+  if (failed) warnings.push(`${failed} liquidation positions could not be verified on-chain; no candidates emitted for them`);
+  await persistWatchlistToDisk(); // Including empty lists after positions recover.
   candidates.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
-  return candidates;
+  return { candidates, warnings };
 }
 
 const positionAbi = parseAbi([

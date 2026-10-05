@@ -114,6 +114,7 @@ export async function submitMevBundleToRelays(params: {
   bundle: MevBundleParams;
   relayUrls?: string[];
   timeoutMs?: number;
+  beforeSubmit?: () => void;
 }): Promise<MevBundleSubmissionSummary> {
   const {
     chainKey,
@@ -140,6 +141,7 @@ export async function submitMevBundleToRelays(params: {
   const results = await Promise.all(
     relayUrls.map(async (relayUrl): Promise<MevBundleRelayResult> => {
       try {
+        params.beforeSubmit?.();
         const res = await fetch(relayUrl, {
           method: 'POST',
           headers: {

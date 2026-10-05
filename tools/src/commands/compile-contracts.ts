@@ -29,6 +29,7 @@ export async function compileContracts(): Promise<{
     },
     settings: {
       viaIR: true,
+      evmVersion: 'shanghai',
       optimizer: {
         enabled: true,
         runs: 200,

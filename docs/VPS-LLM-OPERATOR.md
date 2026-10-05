@@ -90,7 +90,9 @@ chmod 600 .env
 | `flashloan` | Allowed | Allowed | Blocked | Blocked | If `AUTO_BROADCAST=true` |
 | `arbitrage` | Allowed | Blocked | Allowed | Blocked | If `AUTO_BROADCAST=true` |
 | `liquidation` | Allowed | Blocked | Blocked | Allowed | If `AUTO_BROADCAST=true` |
-| `full` | Allowed | Allowed | Allowed | Allowed | If `AUTO_BROADCAST=true` |
+| `full` | Allowed | Blocked by default¹ | Allowed | Allowed | If `AUTO_BROADCAST=true` |
+
+¹ In `full` mode, set `FLASHLOAN_ON_WHITELIST=true` to explicitly opt into flashloan execution. The dedicated `flashloan` mode is itself the opt-in.
 
 ---
 
@@ -143,6 +145,8 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+The application always listens on container port `3000` (matching its healthcheck). To change the host-side port, set `WATCH_HTTP_HOST_PORT` in the repository-root `.env` or in the shell running Compose; values in `tools/.env` are container environment values and are not used for Compose port interpolation.
+
 ### Viewing & Interacting with the CLI on a VPS
 1. **Interactive Menu via SSH** (can be opened anytime even while the background daemon runs):
    ```bash
@@ -167,11 +171,11 @@ When `WATCH_HTTP_PORT=3000` (default), the built-in server binds to `0.0.0.0:300
 
 - **`GET /`**: Real-time dark-mode Web Dashboard displaying Morpho liquidity, contract allowlist status, Multi-DEX arbitrage spreads, and LLM Operator reasoning history.
 - **`GET /health`**: Lightweight JSON health check for Docker, systemd, or Uptime Kuma.
-- **`GET /api/status`**: Complete runtime state (including `wsStatuses` and `atRiskWatchlist`), chain reports, and audit log history in JSON.
+- **`GET /api/status`**: Runtime state (including `wsStatuses` and `atRiskWatchlist`), chain reports, and audit log history in JSON. The LLM API key is always redacted.
 - **`GET /api/watchlist`**: Returns the auto-indexed Morpho Blue Pre-Liquidation Watchlist (`1.00 <= healthFactor <= 1.12`) across all monitored chains (supports optional `?chain=base` filter).
 - **`POST /api/trigger`**: Triggers an immediate scan and evaluation cycle.
 - **`POST /api/mode`**: Dynamically updates `mode`, `autoBroadcast`, or `minProfitUsd` at runtime.
-  - Note: Enabling `autoBroadcast: true` over HTTP requires `OPERATOR_API_TOKEN` to be set in `tools/.env` and passed via `Authorization: Bearer <token>`.
+  - All HTTP control operations (`/api/trigger` and `/api/mode`) fail closed unless `OPERATOR_API_TOKEN` is set in `tools/.env` and passed via `Authorization: Bearer <token>`. The dashboard asks for the token when a control is used and keeps it only in page memory. Without a token, its controls are disabled. `GET /api/status` remains read-only and never includes the LLM API key.
 
 ---
 
@@ -201,3 +205,9 @@ By setting `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `tools/.env`, the daem
 - `/broadcast on` or `/broadcast off` — Enables or disables live on-chain transaction broadcasting (and resets the circuit breaker).
 - `/profit <usd>` — Updates the minimum net USD profit threshold (e.g., `/profit 15`).
 - `/ask <question>` *(or any plain-text message)* — Chat directly with the LLM Operator with full context of live on-chain data.
+
+### Registry persistence and safety
+
+Compose mounts the `evm` directory, not just `deployments.json`, so registry writes can use an atomic rename. It recompiles contract artifacts on startup because this mount hides image-built artifacts. Independent registry field changes are merged under a filesystem lock; conflicting updates fail and require a reload. If a process crashes while holding `evm/deployments.json.lock`, stop all writers and inspect the registry before manually removing that lock directory. Never remove a lock held by a running writer.
+
+Liquidation discovery paginates the indexer (default maximum 50 pages, configurable via `MORPHO_LIQUIDATION_MAX_PAGES`), then verifies positions and quotes on-chain. Pagination caps and unavailable indexers appear in scan warnings; discovery is not guaranteed exhaustive. These local checks are not a substitute for fork testing and an independent contract audit before deployment.

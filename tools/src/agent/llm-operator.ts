@@ -1,3 +1,4 @@
+import { buildWhitelistCooldownKey } from './cooldown.js';
 import { parseUnits } from 'viem';
 import type { RouterKindId } from '../config/dex-routers.js';
 import type { Address } from '../config/registry.js';
@@ -467,7 +468,8 @@ export function evaluateDeterministically(
   // Priority 3: Pending Whitelist Sync (Token or Router)
   const hasPendingWhitelist =
     report.pendingWhitelistAssets.length > 0 || report.pendingWhitelistRouters.length > 0;
-  const whitelistCooldownKey = `whitelist:${report.chain.key}:${report.pendingWhitelistAssets.slice(0, 10).map((a) => a.symbol).join(',')}`;
+  const pendingPlan = buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters);
+  const whitelistCooldownKey = buildWhitelistCooldownKey(report.chain.key, pendingPlan.tokensToAllow, pendingPlan.routersToAllow);
 
   if (
     config.whitelistAutoSync &&
@@ -883,7 +885,8 @@ Format output WAJIB JSON object tanpa markdown tambahan:
       // Policy Guard: `WHITELIST_AUTO_SYNC=false` must be enforced here too. The system prompt
       // only *asks* the model to consider this flag, so without a hard check a model that
       // ignores it could broadcast allowlist transactions the operator explicitly disabled.
-      if (!config.whitelistAutoSync || recentExecutedKeys.has(`whitelist:${report.chain.key}:${report.pendingWhitelistAssets.slice(0, 10).map(a => a.symbol).join(',')}`)) {
+      const pendingPlan = buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters);
+      if (!config.whitelistAutoSync || recentExecutedKeys.has(buildWhitelistCooldownKey(report.chain.key, pendingPlan.tokensToAllow, pendingPlan.routersToAllow))) {
         return {
           action: 'HOLD',
           confidence,

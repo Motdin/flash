@@ -350,6 +350,12 @@ export function selectOptimalArbitrageTier(
   };
 }
 
+/** Route identity never depends on untrusted/non-unique token symbols or display names. */
+export function arbitrageRouteKey(chainKey: string, loanToken: Address, steps: SwapHopStepQuote[]): string {
+  return [chainKey, loanToken.toLowerCase(), ...steps.map(s =>
+    [s.tokenIn.toLowerCase(), s.tokenOut.toLowerCase(), s.router.toLowerCase(), s.kind, s.fee, s.stable, s.factory.toLowerCase()].join('/'))].join(':');
+}
+
 export function evaluateArbitrageQuote(params: {
   chainKey: string;
   loanAsset: ScannedAsset;
@@ -446,7 +452,7 @@ export function evaluateArbitrageQuote(params: {
   ];
 
   return {
-    id: `${chainKey}:${loanAsset.address.toLowerCase()}:${intermediateAsset.address.toLowerCase()}:${firstRouter.address.toLowerCase()}:${firstRouter.kind}:${firstRouter.v3FeeTier ?? 0}:${firstRouter.aeroStable ?? false}:${secondRouter.address.toLowerCase()}:${secondRouter.kind}:${secondRouter.v3FeeTier ?? 0}:${secondRouter.aeroStable ?? false}:${loanAmount}`,
+    id: `${arbitrageRouteKey(chainKey, loanAsset.address, steps)}:${loanAmount}`,
     chain: chainKey,
     loanToken: loanAsset.address,
     loanSymbol: loanAsset.symbol,
@@ -585,7 +591,7 @@ export function evaluateMultiHopArbitrageQuote(params: {
   const profitable = grossProfit >= requiredProfitUnits && netProfitUsd >= minProfitUsd;
 
   return {
-    id: `${chainKey}:tri:${loanAsset.symbol}->${pathSymbols}->${loanAsset.symbol}@${routerNames}($${Math.round(loanAmountUsd)})`,
+    id: `${arbitrageRouteKey(chainKey, loanAsset.address, steps)}:${loanAmount}`,
     chain: chainKey,
     loanToken: loanAsset.address,
     loanSymbol: loanAsset.symbol,
@@ -631,17 +637,16 @@ export function evaluateMultiHopArbitrageQuote(params: {
 }
 
 function inferNativePriceUsd(chain: EvmChainConfig, assets: ScannedAsset[]): number {
-  const nativeUpper = chain.nativeSymbol.toUpperCase();
-  const wrappedMatch = assets.find((asset) => {
-    const sym = asset.symbol.toUpperCase();
-    return (
-      asset.priceUsd &&
-      asset.priceUsd > 0 && asset.priceTimestamp !== null && Date.now() / 1000 - asset.priceTimestamp <= 3600 &&
-      (sym === nativeUpper || sym === `W${nativeUpper}` || (nativeUpper === 'ETH' && sym === 'WETH'))
-    );
-  });
-  if (wrappedMatch?.priceUsd) return wrappedMatch.priceUsd;
-  return 0; // Unknown price: executor refuses trading rather than inventing a gas price in USD.
+  const wrapped: Record<string, string> = {
+    ethereum: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+    base: '0x4200000000000000000000000000000000000006',
+    optimism: '0x4200000000000000000000000000000000000006',
+    arbitrum: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
+  };
+  const now = Date.now() / 1000;
+  return assets.find(a => a.address.toLowerCase() === wrapped[chain.key]
+    && a.priceUsd !== null && Number.isFinite(a.priceUsd) && a.priceUsd > 0
+    && a.priceTimestamp !== null && a.priceTimestamp <= now + 300 && now - a.priceTimestamp <= 3600)?.priceUsd ?? 0;
 }
 
 type QuoteCallRequest = {
@@ -1248,7 +1253,7 @@ export async function scanChainOpportunities(
   // Group by route pair and pick the optimal loan size tier + parabolic interpolation
   const byRouteKey = new Map<string, ArbitrageCandidate[]>();
   for (const cand of allTierCandidates) {
-    const routeKey = `${cand.isMultiHop ? 'tri:' : ''}${cand.loanSymbol}->${cand.intermediateSymbol}@${cand.firstRouterName}->${cand.secondRouterName}`;
+    const routeKey = arbitrageRouteKey(options.chain.key, cand.loanToken, cand.steps ?? []);
     const list = byRouteKey.get(routeKey) ?? [];
     list.push(cand);
     byRouteKey.set(routeKey, list);
@@ -1264,7 +1269,7 @@ export async function scanChainOpportunities(
   const profitableCandidates = arbitrageCandidates.filter((item) => item.profitable);
 
   // Scan Morpho Blue Liquidations (GraphQL + On-Chain Indexer + Pre-Liquidation Watchlist)
-  const liquidationCandidates = await scanMorphoLiquidations({
+  const liquidationScan = await scanMorphoLiquidations({
     chain: options.chain,
     rpcUrl: options.rpcUrl,
     routers: activeRouters,
@@ -1273,6 +1278,8 @@ export async function scanChainOpportunities(
     minProfitUsd,
     maxSlippageBps,
   });
+  const liquidationCandidates = liquidationScan.candidates;
+  warnings.push(...liquidationScan.warnings);
   const profitableLiquidations = liquidationCandidates.filter((item) => item.profitable);
 
   return {

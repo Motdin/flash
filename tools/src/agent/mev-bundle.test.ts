@@ -236,3 +236,20 @@ test('RPC receipt failure after target block is unknown, not a zero-gas miss', a
   assert.equal(result.status, 'unknown');
   assert.equal(resolveBundleBroadcastDecision({ bundleEnabled: true, relaysAttempted: 1, relaysAccepted: 1, inclusion: result.status }).action, 'bundle-only');
 });
+
+test('relay submission rechecks runtime policy after signing and sends nothing when stopped', async () => {
+  const { submitMevBundleToRelays } = await import('./mev-bundle.js');
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; throw new Error('Unexpected network request'); };
+  try {
+    const result = await submitMevBundleToRelays({
+      chainKey: 'ethereum', authPrivateKey: `0x${'11'.repeat(32)}`,
+      bundle: { txs: [await signFixture(1)], targetBlockNumber: 1n },
+      relayUrls: ['https://relay.invalid'],
+      beforeSubmit: () => { throw new Error('Broadcast cancelled: stopped'); },
+    });
+    assert.equal(calls, 0);
+    assert.equal(result.relaysAccepted, 0);
+  } finally { globalThis.fetch = originalFetch; }
+});

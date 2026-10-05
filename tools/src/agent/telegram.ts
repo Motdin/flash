@@ -197,6 +197,9 @@ function buildMainMenuKeyboard(state: OperatorRuntimeState): TgInlineButton[][] 
     [
       { text: 'Mode: flashloan', callback_data: 'mode:flashloan' },
       { text: 'Mode: arbitrage', callback_data: 'mode:arbitrage' },
+    ],
+    [
+      { text: 'Mode: liquidation', callback_data: 'mode:liquidation' },
       { text: 'Mode: FULL', callback_data: 'mode:full' },
     ],
   ];
@@ -292,7 +295,7 @@ export async function handleTelegramCommand(
           `• \`/whitelist\` — Cek token whitelisted & pending allowlist\n` +
           `• \`/arb\` — Cek spread & profit rute DEX V2\n` +
           `• \`/history\` — 5 keputusan terakhir operator LLM\n` +
-          `• \`/mode <nama>\` — Ubah mode (\`dry-run\`, \`whitelist-only\`, \`flashloan\`, \`arbitrage\`, \`full\`)\n` +
+          `• \`/mode <nama>\` — Ubah mode (\`dry-run\`, \`whitelist-only\`, \`flashloan\`, \`arbitrage\`, \`liquidation\`, \`full\`)\n` +
           `• \`/broadcast <on|off>\` — Aktifkan/matikan transaksi live\n` +
           `• \`/profit <usd>\` — Ubah minimum profit USD (contoh: \`/profit 10\`)\n` +
           `• \`/ask <pertanyaan>\` — Tanya langsung ke LLM Operator`,
@@ -326,7 +329,7 @@ export async function handleTelegramCommand(
       const valid: OperatorMode[] = ['dry-run', 'whitelist-only', 'flashloan', 'arbitrage', 'liquidation', 'full'];
       if (!valid.includes(target)) {
         return {
-          reply: `⚠️ Mode tidak valid. Pilih salah satu:\n\`/mode dry-run\`\n\`/mode whitelist-only\`\n\`/mode flashloan\`\n\`/mode arbitrage\`\n\`/mode full\``,
+          reply: `⚠️ Mode tidak valid. Pilih salah satu:\n\`/mode dry-run\`\n\`/mode whitelist-only\`\n\`/mode flashloan\`\n\`/mode arbitrage\`\n\`/mode liquidation\`\n\`/mode full\``,
           showMenu: true,
         };
       }
@@ -478,6 +481,13 @@ export function startTelegramBotController(handlers: TelegramControllerHandlers)
 
             if (dataStr.startsWith('mode:')) {
               const nextMode = dataStr.slice(5) as OperatorMode;
+              const validModes: OperatorMode[] = [
+                'dry-run', 'whitelist-only', 'flashloan', 'arbitrage', 'liquidation', 'full',
+              ];
+              if (!validModes.includes(nextMode)) {
+                await answerCallback(cb.id, 'Mode tidak valid');
+                continue;
+              }
               handlers.updateConfig({ mode: nextMode });
               await answerCallback(cb.id, `Mode diubah ke ${nextMode}`);
               await sendMessage(cbChatId, `✅ Mode operator diubah ke *${nextMode}*`, true);

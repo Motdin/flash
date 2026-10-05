@@ -15,7 +15,7 @@ import {
   type Hash,
   type Hex,
 } from 'viem';
-import { ExecutionCooldown } from './cooldown.js';
+import { ExecutionCooldown, buildWhitelistCooldownKey } from './cooldown.js';
 import { estimateL1Fee, estimateOperatorFee } from 'viem/op-stack';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { EvmChainConfig } from '../config/chains.js';
@@ -26,7 +26,7 @@ import {
   type Address,
 } from '../config/registry.js';
 import type { ChainOpportunityReport } from '../morpho/dex-scanner.js';
-import { isActionAllowedByMode, canExecuteArbitrageCandidate } from './llm-operator.js';
+import { isActionAllowedByMode, canExecuteArbitrageCandidate, isFlashloanExecutionRequested } from './llm-operator.js';
 import type {
   ArbitrageExecutionPlan,
   LlmOperatorConfig,
@@ -257,13 +257,13 @@ export async function executeOperatorDecision(params: {
   const executionKey = decision.arbitragePlan ? `arb:${decision.arbitragePlan.candidateId}`
     : decision.liquidationPlan ? `liq:${decision.liquidationPlan.candidateId}`
     : decision.flashloanPlan ? `flashloan:${report.chain.key}:${decision.flashloanPlan.symbol}`
-    : decision.whitelistPlan ? `whitelist:${report.chain.key}:${decision.whitelistPlan.tokensToAllow.map(t => t.symbol).join(',')}` : undefined;
+    : decision.whitelistPlan ? buildWhitelistCooldownKey(report.chain.key, decision.whitelistPlan.tokensToAllow, decision.whitelistPlan.routersToAllow) : undefined;
   const forbidden = !isActionAllowedByMode(decision.action, config.mode)
     || (executionKey !== undefined && recentExecutedKeys.has(executionKey))
     || (decision.action === 'SYNC_WHITELIST' && (!config.whitelistAutoSync
       || decision.whitelistPlan?.tokensToAllow.some(t => !report.pendingWhitelistAssets.some(a => a.address.toLowerCase() === t.address.toLowerCase()))
       || decision.whitelistPlan?.routersToAllow.some(r => !report.pendingWhitelistRouters.some(a => a.address.toLowerCase() === r.address.toLowerCase()))))
-    || (decision.action === 'EXECUTE_FLASHLOAN' && report.flashExecutorPaused)
+    || (decision.action === 'EXECUTE_FLASHLOAN' && (report.flashExecutorPaused || !isFlashloanExecutionRequested(config.mode, config.flashloanOnWhitelist)))
     || (decision.action === 'EXECUTE_LIQUIDATION' && (report.arbExecutorPaused
       || !report.profitableLiquidations.some(c => c.id === decision.liquidationPlan?.candidateId)))
     || (decision.arbitragePlan !== undefined && !report.profitableCandidates.some(c =>
@@ -280,6 +280,15 @@ export async function executeOperatorDecision(params: {
   });
 
   const shouldBroadcast = config.autoBroadcast && config.mode !== 'dry-run';
+  const policySnapshot = () => JSON.stringify([config.mode, config.minProfitUsd, config.maxGasGwei,
+    config.whitelistAutoSync, config.flashloanOnWhitelist, config.profitBribeBps, config.maxPriorityFeeGwei]);
+  const approvedPolicy = policySnapshot();
+  const assertBroadcastAllowed = () => {
+    if (!shouldBroadcast || !config.autoBroadcast || config.mode === 'dry-run'
+      || !isActionAllowedByMode(decision.action, config.mode) || policySnapshot() !== approvedPolicy) {
+      throw new Error('Broadcast cancelled: operator policy changed during execution');
+    }
+  };
   const isOfflineSimulation = report.warnings.some((w) => w.startsWith('offline-rpc-simulation'));
 
   if (isOfflineSimulation && shouldBroadcast) {
@@ -353,7 +362,11 @@ export async function executeOperatorDecision(params: {
       ? createWalletClient({
           account,
           chain: chainConfig,
-          transport: http(broadcastRpcInfo.url),
+          transport: http(broadcastRpcInfo.url, {
+            retryCount: 0,
+            // Checked at the final HTTP boundary, including after async gas/nonce preparation.
+            fetchFn: async (input, init) => { assertBroadcastAllowed(); return fetch(input, init); },
+          }),
         })
       : undefined;
 
@@ -546,7 +559,7 @@ export async function executeOperatorDecision(params: {
         await saveDeployments(registry);
       }
 
-      const cooldownKey = `whitelist:${report.chain.key}:${plan.tokensToAllow.map((t) => t.symbol).join(',')}`;
+      const cooldownKey = buildWhitelistCooldownKey(report.chain.key, plan.tokensToAllow, plan.routersToAllow);
       if (txHashes.length > 0) recentExecutedKeys.add(cooldownKey);
 
       return {
@@ -735,6 +748,7 @@ export async function executeOperatorDecision(params: {
               args: [multiHopStruct],
             });
             const nonce = await publicClient.getTransactionCount({ address: account.address, blockTag: 'pending' });
+            assertBroadcastAllowed();
             const signedRawTx = await walletClient.signTransaction({
               account,
               to: report.arbExecutor,
@@ -747,6 +761,7 @@ export async function executeOperatorDecision(params: {
             const targetBlockNumber = await publicClient.getBlockNumber({ cacheTime: 0 }) + 1n;
             const bundleSummary = await submitMevBundleToRelays({
               chainKey: report.chain.key,
+              beforeSubmit: assertBroadcastAllowed,
               authPrivateKey: resolveBundleAuthKey(process.env.FLASHBOTS_AUTH_KEY, pk),
               bundle: {
                 txs: [signedRawTx],
