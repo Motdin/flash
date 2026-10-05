@@ -29,7 +29,13 @@ import type {
   OperatorActionType,
   OperatorDecision,
 } from './llm-operator.js';
-import { submitMevBundleToRelays } from './mev-bundle.js';
+import {
+  awaitBundleInclusion,
+  bundleTxHash,
+  resolveBundleBroadcastDecision,
+  shouldWaitForBundle,
+  submitMevBundleToRelays,
+} from './mev-bundle.js';
 
 const flashLoanExecutorAbi = parseAbi([
   'function owner() view returns (address)',
@@ -624,6 +630,7 @@ export async function executeOperatorDecision(params: {
       let simulatedProfit = 0n;
       let estimatedGasUnits = 280_000n;
       const mevBundleHashes: string[] = [];
+      let mevBundleNote: string | undefined;
 
       if (isMultiHop && plan.steps) {
         const multiHopStruct = {
@@ -675,7 +682,11 @@ export async function executeOperatorDecision(params: {
         });
 
         if (shouldBroadcast && walletClient && account && pk) {
-          if (process.env.MEV_BUNDLE_ENABLED === 'true') {
+          const bundleEnabled = process.env.MEV_BUNDLE_ENABLED === 'true';
+          let bundledTxHash: Hash | undefined;
+          let bundleMissed = false;
+
+          if (bundleEnabled) {
             const callData = encodeFunctionData({
               abi: arbExecutorAbi,
               functionName: 'executeMultiHopArbitrage',
@@ -691,31 +702,121 @@ export async function executeOperatorDecision(params: {
               maxFeePerGas: priorityFee.maxFeePerGas,
               nonce,
             });
+            const targetBlockNumber = report.blockNumber + 1n;
             const bundleSummary = await submitMevBundleToRelays({
               chainKey: report.chain.key,
               authPrivateKey: (process.env.FLASHBOTS_AUTH_KEY as Hex | undefined) ?? pk,
               bundle: {
                 txs: [signedRawTx],
-                targetBlockNumber: report.blockNumber + 1n,
+                targetBlockNumber,
               },
             });
             mevBundleHashes.push(...bundleSummary.bundleHashes);
+
+            const bundledHash = bundleTxHash(signedRawTx);
+            if (
+              shouldWaitForBundle({
+                bundleEnabled,
+                relaysAttempted: bundleSummary.relaysAttempted,
+                relaysAccepted: bundleSummary.relaysAccepted,
+              })
+            ) {
+              // At least one builder now holds this exact signed transaction. Broadcasting it a
+              // second time through a public RPC would publish the private route to the mempool —
+              // which is the only thing the relay submission was meant to prevent — so the bundled
+              // transaction hash is watched directly instead.
+              const inclusion = await awaitBundleInclusion({
+                txHash: bundledHash,
+                targetBlockNumber,
+                maxBlocks: Number(process.env.MEV_BUNDLE_WAIT_BLOCKS ?? '4'),
+                getReceipt: async (txHash) => {
+                  const receipt = await publicClient
+                    .getTransactionReceipt({ hash: txHash })
+                    .catch(() => null);
+                  return receipt ? { blockNumber: receipt.blockNumber, status: receipt.status } : null;
+                },
+                getBlockNumber: () => publicClient.getBlockNumber(),
+              });
+              const decision = resolveBundleBroadcastDecision({
+                bundleEnabled,
+                relaysAttempted: bundleSummary.relaysAttempted,
+                relaysAccepted: bundleSummary.relaysAccepted,
+                inclusion: inclusion.status,
+              });
+
+              if (decision.countAsFailure) {
+                throw new Error(`Transaksi Multi-Hop dalam bundle MEV revert: ${bundledHash}`);
+              }
+
+              if (inclusion.status === 'missed') {
+                // Nothing was mined, so nothing was paid for. Re-sending the same nonce publicly
+                // would leak the route and still lose the race, so the cycle simply abstains and
+                // the next scan re-quotes the opportunity.
+                bundleMissed = true;
+                mevBundleNote =
+                  `bundle target blok ${targetBlockNumber} tidak dimasukkan builder ` +
+                  `(${bundleSummary.relaysAccepted} relay menerima, ${inclusion.polls} poll, ` +
+                  `blok terakhir ${inclusion.lastSeenBlockNumber})`;
+              } else {
+                bundledTxHash = bundledHash;
+                txHashes.push(bundledHash);
+                explorerUrls.push(`${report.chain.explorer}/tx/${bundledHash}`);
+                mevBundleNote = `dieksekusi via bundle MEV di blok ${inclusion.receipt.blockNumber}`;
+              }
+            } else {
+              // No relay is holding the transaction, so the public/private-RPC path stays in charge.
+              // The wording comes from the same tested decision table as the success/miss branches.
+              const fallback = resolveBundleBroadcastDecision({
+                bundleEnabled,
+                relaysAttempted: bundleSummary.relaysAttempted,
+                relaysAccepted: bundleSummary.relaysAccepted,
+                inclusion: 'not-checked',
+              });
+              mevBundleNote =
+                `MEV bundle tidak berlaku di ${report.chain.key} ` +
+                `(relay dicoba ${bundleSummary.relaysAttempted}, diterima ${bundleSummary.relaysAccepted}): ` +
+                `${fallback.reason}`;
+            }
           }
 
-          const hash = await walletClient.writeContract({
-            address: report.arbExecutor,
-            abi: arbExecutorAbi,
-            functionName: 'executeMultiHopArbitrage',
-            args: [multiHopStruct],
-            maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
-            maxFeePerGas: priorityFee.maxFeePerGas,
-          });
-          const receipt = await publicClient.waitForTransactionReceipt({ hash });
-          if (receipt.status !== 'success') {
-            throw new Error(`Transaksi Multi-Hop arbitrase revert: ${hash}`);
+          if (bundledTxHash === undefined && !bundleMissed) {
+            const hash = await walletClient.writeContract({
+              address: report.arbExecutor,
+              abi: arbExecutorAbi,
+              functionName: 'executeMultiHopArbitrage',
+              args: [multiHopStruct],
+              maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
+              maxFeePerGas: priorityFee.maxFeePerGas,
+            });
+            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            if (receipt.status !== 'success') {
+              throw new Error(`Transaksi Multi-Hop arbitrase revert: ${hash}`);
+            }
+            txHashes.push(hash);
+            explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
           }
-          txHashes.push(hash);
-          explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
+          if (bundleMissed) {
+            // Clear the cooldown registered before broadcasting so a missed bundle is retried on
+            // the next cycle instead of being skipped for the rest of the daemon's life.
+            recentExecutedKeys.delete(`arb:${plan.candidateId}`);
+            return {
+              action: 'EXECUTE_ARBITRAGE',
+              chain: report.chain.key,
+              simulated: true,
+              simulationSuccess: true,
+              broadcasted: false,
+              usedPrivateRpc: broadcastRpcInfo.isPrivate,
+              ...(mevBundleHashes.length > 0 ? { mevBundleHashes } : {}),
+              txHashes,
+              explorerUrls,
+              summary:
+                `[MEV BUNDLE MISS] ${mevBundleNote ?? 'Bundle arbitrase tidak masuk blok target'} — ` +
+                `0 gas terpakai dan ${plan.loanSymbol}->${plan.intermediateSymbol} (~$${plan.expectedNetProfitUsd.toFixed(2)} net) ` +
+                'dievaluasi ulang dengan quote segar pada siklus berikutnya.',
+              timestamp,
+            };
+          }
         }
       } else if (isPureV2) {
         const v2Struct = {
@@ -861,7 +962,7 @@ export async function executeOperatorDecision(params: {
         txHashes,
         explorerUrls,
         summary: shouldBroadcast
-          ? `Arbitrase ${plan.loanSymbol}->${plan.intermediateSymbol} berhasil dieksekusi (${broadcastRpcInfo.isPrivate ? 'Private MEV RPC' : 'Standard RPC'})! Realized profit: ${formattedProfit} ${plan.loanSymbol}`
+          ? `Arbitrase ${plan.loanSymbol}->${plan.intermediateSymbol} berhasil dieksekusi (${broadcastRpcInfo.isPrivate ? 'Private MEV RPC' : 'Standard RPC'})! Realized profit: ${formattedProfit} ${plan.loanSymbol}${mevBundleNote ? ` [MEV: ${mevBundleNote}]` : ''}`
           : `[SIMULATED] Simulasi arbitrase berhasil! Profit on-chain: ${formattedProfit} ${plan.loanSymbol} (~$${plan.expectedNetProfitUsd.toFixed(2)} net).`,
         timestamp,
       };

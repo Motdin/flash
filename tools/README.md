@@ -53,6 +53,12 @@ npm run cli -- scan-all --min-usd 100000
 # Scan Multi-DEX arbitrage quotes & whitelist status on a chain
 npm run cli -- arb-scan --chain base --loan-usd 10000 --min-profit-usd 5
 
+# Scan Morpho Blue liquidation candidates + pre-liquidation watchlist on a chain
+npm run cli -- liq-scan --chain base --max-hf 1.05 --min-profit-usd 5
+
+# Read the persisted at-risk watchlist only (no RPC/quote scan, safe for cron)
+npm run cli -- liq-scan --at-risk [--chain base] [--json]
+
 # Compile Solidity contracts using the embedded solc compiler
 npm run compile:contracts
 

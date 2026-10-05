@@ -24,9 +24,9 @@ A full-stack EVM toolkit for **Morpho Blue** featuring:
 | Morpho Blue Auto-Indexer, Watchlist & Liquidation Executor | **Active** | Auto-indexes borrowers from Morpho Blue GraphQL + on-chain `Borrow` logs, maintains a Pre-Liquidation Watchlist (`1.00 <= HF <= 1.12`), and executes `onMorphoLiquidate` |
 | Event-Driven WebSocket (`wss://`) & Base Flashblocks Stream | **Active** | Real-time `watchBlockNumber` & Morpho event subscriptions (`ws-listener.ts`) including 200ms Base Flashblocks pre-confirmations |
 | VPS LLM Watch Operator + `<1ms` Fast-Path Engine | **Active** | Combines sub-millisecond Fast-Path execution for profitable routes with an OpenAI-compatible LLM Operator |
-| Native Flashbots / Builder Bundles & Dynamic Priority Fee | **Active** | EIP-191 signed `eth_sendBundle` fanout to Flashbots, Titan, Beaverbuild, & Rsync (`mev-bundle.ts`) + Private Tx RPCs & EIP-1559 profit-share bribes |
+| Native Flashbots / Builder Bundles & Dynamic Priority Fee | **Active** | EIP-191 signed `eth_sendBundle` fanout to Flashbots, Titan, Beaverbuild, & Rsync (`mev-bundle.ts`) + Private Tx RPCs & EIP-1559 profit-share bribes. When a relay accepts the bundle the transaction is **never** re-broadcast publicly — inclusion is tracked by the bundled tx hash for up to `MEV_BUNDLE_WAIT_BLOCKS` blocks, and a miss costs 0 gas without tripping the circuit breaker |
 | Two-Way Telegram Bot Controller & Web Dashboard | **Active** | Interactive Telegram inline keyboard (`/menu`, `/status`, `/scan`, `/mode`, `/broadcast`, `/ask`) + HTTP UI on port `3000` |
-| Embedded `solc` Contract Compiler | **Active** | Pre-built artifacts in `evm/out/` + `npm run compile:contracts` (no Foundry installation required on VPS) |
+| Embedded `solc` Contract Compiler | **Active** | `npm run compile:contracts` builds `evm/out/` from `evm/src/` with the bundled `solc` (no Foundry installation required on VPS); the Docker image compiles the artifacts during build, so a fresh clone never needs pre-built output |
 
 ---
 
@@ -186,6 +186,7 @@ Interactive Menu Options:
 - `3 RUN FLASHLOAN` — Execute an atomic zero-fee flashloan.
 - `4 LLM WATCH OPERATOR` — Start the autonomous VPS watch daemon & HTTP dashboard.
 - `5 ARB EXECUTOR SETUP` — Deploy or sync `MorphoAtomicArbPOC` (Multi-DEX Arbitrage & Liquidation executor).
+- `6 LIQUIDATION WATCHLIST` — Scan Morpho Blue liquidation candidates and the pre-liquidation watchlist (`1.00 <= HF <= 1.12`).
 
 ### Liquidity & Multi-DEX Opportunity Scanning
 
@@ -199,6 +200,13 @@ npm run cli -- scan-all --chains ethereum,base,arbitrum --min-usd 100000
 
 # Scan whitelist status + Multi-DEX (V2, V3, Aerodrome) arbitrage spreads & optimal loan tiers
 npm run cli -- arb-scan --chain base --loan-usd 10000 --min-profit-usd 5
+
+# Scan Morpho Blue liquidation candidates + the pre-liquidation watchlist for one chain
+npm run cli -- liq-scan --chain base --max-hf 1.05 --min-profit-usd 5
+
+# Read only the persisted at-risk watchlist (no RPC quotes; cron & pre-flight checks)
+npm run cli -- liq-scan --at-risk --chain base
+npm run cli -- liq-scan --at-risk --json
 ```
 
 ### Deploying & Syncing Executors
@@ -252,7 +260,8 @@ npm run cli -- watch --chains base,arbitrum --mode full --interval 15 --broadcas
    - If the LLM API is unreachable or rate-limited, `LLM_FALLBACK_DETERMINISTIC=true` seamlessly falls back to the deterministic rule engine so the VPS daemon never halts.
 5. **Mandatory On-Chain Simulation, MEV Protection & Circuit Breaker**:
    - Every transaction must pass `publicClient.simulateContract(...)` on the latest block before signing.
-   - Supports private broadcast endpoints (`PRIVATE_TX_RPC_URL` / `ETHEREUM_PRIVATE_RPC_URL`) and dynamic EIP-1559 priority fees (`PROFIT_BRIBE_BPS`).
+   - Supports private broadcast endpoints (`PRIVATE_TX_RPC_URL` / `<CHAIN>_PRIVATE_RPC_URL`) and dynamic EIP-1559 priority fees (`PROFIT_BRIBE_BPS`).
+   - With `MEV_BUNDLE_ENABLED=true`, a bundle accepted by a relay is tracked by its own transaction hash and the public broadcast is **skipped** — re-broadcasting would leak the private route. A bundle the builder never included costs 0 gas, is reported as `[MEV BUNDLE MISS]`, keeps the circuit breaker silent, and the candidate's cooldown is cleared so the next cycle re-quotes it.
    - If `MAX_CONSECUTIVE_FAILURES` (default `3`) simulations or broadcasts fail in a row, the **Circuit Breaker** automatically trips and disables `autoBroadcast` to protect wallet gas.
 
 ---
