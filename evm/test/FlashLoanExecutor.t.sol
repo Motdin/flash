@@ -93,3 +93,43 @@ contract FlashLoanExecutorTest {
         result[0] = token;
     }
 }
+
+contract NoReturnToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 value) external { balanceOf[to] += value; }
+    function approve(address spender, uint256 value) external {
+        require(value == 0 || allowance[msg.sender][spender] == 0, "zero-first");
+        allowance[msg.sender][spender] = value;
+    }
+    function transfer(address to, uint256 value) external {
+        balanceOf[msg.sender] -= value; balanceOf[to] += value;
+    }
+    function transferFrom(address from, address to, uint256 value) external {
+        allowance[from][msg.sender] -= value;
+        balanceOf[from] -= value; balanceOf[to] += value;
+    }
+}
+contract NoReturnMorpho {
+    function flashLoan(address token, uint256 amount, bytes calldata data) external {
+        NoReturnToken(token).transfer(msg.sender, amount);
+        FlashLoanExecutor(msg.sender).onMorphoFlashLoan(amount, data);
+        NoReturnToken(token).transferFrom(msg.sender, address(this), amount);
+    }
+}
+contract FlashLoanOptionalReturnTest {
+    function testNoReturnTokenRepaymentAndRescue() external {
+        NoReturnToken token = new NoReturnToken();
+        NoReturnMorpho morpho = new NoReturnMorpho();
+        address[] memory tokens = new address[](1); tokens[0] = address(token);
+        FlashLoanExecutor executor = new FlashLoanExecutor(address(morpho), tokens);
+        token.mint(address(morpho), 1000);
+        executor.flashLoan(address(token), 100);
+        executor.flashLoan(address(token), 100);
+        require(token.balanceOf(address(morpho)) == 1000, "repayment");
+        require(token.allowance(address(executor), address(morpho)) == 0, "allowance");
+        token.mint(address(executor), 50);
+        executor.rescueToken(address(token), address(this), 50);
+        require(token.balanceOf(address(this)) == 50, "rescue");
+    }
+}

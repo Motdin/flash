@@ -1,5 +1,6 @@
 import {
   createPublicClient,
+  decodeEventLog,
   createWalletClient,
   defineChain,
   encodeFunctionData,
@@ -14,6 +15,8 @@ import {
   type Hash,
   type Hex,
 } from 'viem';
+import { ExecutionCooldown } from './cooldown.js';
+import { estimateL1Fee, estimateOperatorFee } from 'viem/op-stack';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { EvmChainConfig } from '../config/chains.js';
 import {
@@ -23,6 +26,7 @@ import {
   type Address,
 } from '../config/registry.js';
 import type { ChainOpportunityReport } from '../morpho/dex-scanner.js';
+import { isActionAllowedByMode, canExecuteArbitrageCandidate } from './llm-operator.js';
 import type {
   ArbitrageExecutionPlan,
   LlmOperatorConfig,
@@ -33,6 +37,7 @@ import {
   awaitBundleInclusion,
   bundleTxHash,
   resolveBundleBroadcastDecision,
+  resolveBundleAuthKey,
   shouldWaitForBundle,
   submitMevBundleToRelays,
 } from './mev-bundle.js';
@@ -46,6 +51,9 @@ const flashLoanExecutorAbi = parseAbi([
 ]);
 
 const arbExecutorAbi = parseAbi([
+  'event ArbitrageExecuted(address indexed loanToken,address indexed intermediateToken,uint256 loanAmount,uint256 profit,address indexed profitReceiver)',
+  'event MultiHopArbitrageExecuted(address indexed loanToken,uint256 hopsCount,uint256 loanAmount,uint256 profit,address indexed profitReceiver)',
+  'event LiquidationExecuted(address indexed borrower,address indexed loanToken,address indexed collateralToken,uint256 seizedAssets,uint256 repaidAssets,uint256 profit,address profitReceiver)',
   'function owner() view returns (address)',
   'function operator() view returns (address)',
   'function morpho() view returns (address)',
@@ -75,6 +83,9 @@ export type ExecutionOutcome = {
   summary: string;
   error?: string;
   timestamp: string;
+  realizedGrossProfit?: string;
+  simulatedGrossProfit?: string;
+  executionGasCostNative?: string;
 };
 
 /**
@@ -127,17 +138,17 @@ export function computeDynamicPriorityFee(params: {
   const clampedBps = Math.max(0, Math.min(5_000, profitBribeBps));
   const bribeBudgetUsd = (surplusUsd * clampedBps) / 10_000;
 
-  let priorityFeeWei = parseGwei('0.01');
+  let priorityFeeWei = 0n;
   if (bribeBudgetUsd > 0 && nativePriceUsd > 0 && estimatedGasUnits > 0n) {
     const bribeNative = bribeBudgetUsd / nativePriceUsd;
-    const totalBribeWei = parseUnits(bribeNative.toFixed(12).replace(/\.?0+$/, '') || '0', 18);
+    const totalBribeWei = parseUnits(bribeNative.toFixed(12) || '0', 18);
     const perGasWei = totalBribeWei / estimatedGasUnits;
     if (perGasWei > priorityFeeWei) {
       priorityFeeWei = perGasWei;
     }
   }
 
-  const capWei = parseGwei(String(Math.max(0.01, maxPriorityFeeGwei)));
+  const capWei = parseGwei(String(Math.max(0, maxPriorityFeeGwei)));
   if (priorityFeeWei > capWei) {
     priorityFeeWei = capWei;
   }
@@ -151,7 +162,7 @@ export function computeDynamicPriorityFee(params: {
 }
 
 function buildViemChain(chain: EvmChainConfig, rpc: string) {
-  const readRpcUrls = [...(chain.readRpcFallbacks ?? []), rpc].filter(
+  const readRpcUrls = [rpc, ...(chain.readRpcFallbacks ?? [])].filter(
     (url, index, urls) => urls.indexOf(url) === index,
   );
   return defineChain({
@@ -168,7 +179,7 @@ function buildViemChain(chain: EvmChainConfig, rpc: string) {
 }
 
 function buildReadTransport(chain: EvmChainConfig, rpc: string) {
-  const urls = [...(chain.readRpcFallbacks ?? []), rpc].filter(
+  const urls = [rpc, ...(chain.readRpcFallbacks ?? [])].filter(
     (url, index, values) => values.indexOf(url) === index,
   );
   return urls.length === 1
@@ -243,6 +254,25 @@ export async function executeOperatorDecision(params: {
     };
   }
 
+  const executionKey = decision.arbitragePlan ? `arb:${decision.arbitragePlan.candidateId}`
+    : decision.liquidationPlan ? `liq:${decision.liquidationPlan.candidateId}`
+    : decision.flashloanPlan ? `flashloan:${report.chain.key}:${decision.flashloanPlan.symbol}`
+    : decision.whitelistPlan ? `whitelist:${report.chain.key}:${decision.whitelistPlan.tokensToAllow.map(t => t.symbol).join(',')}` : undefined;
+  const forbidden = !isActionAllowedByMode(decision.action, config.mode)
+    || (executionKey !== undefined && recentExecutedKeys.has(executionKey))
+    || (decision.action === 'SYNC_WHITELIST' && (!config.whitelistAutoSync
+      || decision.whitelistPlan?.tokensToAllow.some(t => !report.pendingWhitelistAssets.some(a => a.address.toLowerCase() === t.address.toLowerCase()))
+      || decision.whitelistPlan?.routersToAllow.some(r => !report.pendingWhitelistRouters.some(a => a.address.toLowerCase() === r.address.toLowerCase()))))
+    || (decision.action === 'EXECUTE_FLASHLOAN' && report.flashExecutorPaused)
+    || (decision.action === 'EXECUTE_LIQUIDATION' && (report.arbExecutorPaused
+      || !report.profitableLiquidations.some(c => c.id === decision.liquidationPlan?.candidateId)))
+    || (decision.arbitragePlan !== undefined && !report.profitableCandidates.some(c =>
+      c.id === decision.arbitragePlan!.candidateId && canExecuteArbitrageCandidate(report, config, c)));
+  if (forbidden) {
+    return { action: decision.action, chain: report.chain.key, simulated: false, simulationSuccess: false,
+      broadcasted: false, txHashes: [], explorerUrls: [], summary: 'Policy/cooldown guard: execution refused', timestamp };
+  }
+
   const chainConfig = buildViemChain(report.chain, rpcUrl);
   const publicClient = createPublicClient({
     chain: chainConfig,
@@ -252,64 +282,64 @@ export async function executeOperatorDecision(params: {
   const shouldBroadcast = config.autoBroadcast && config.mode !== 'dry-run';
   const isOfflineSimulation = report.warnings.some((w) => w.startsWith('offline-rpc-simulation'));
 
+  if (isOfflineSimulation && shouldBroadcast) {
+    return { action: decision.action, chain: report.chain.key, simulated: false, simulationSuccess: false,
+      broadcasted: false, txHashes: [], explorerUrls: [], summary: 'Synthetic/offline reports must never be broadcast', timestamp };
+  }
   if (isOfflineSimulation && !shouldBroadcast) {
     if (decision.action === 'SYNC_WHITELIST' && decision.whitelistPlan) {
       const tokens = decision.whitelistPlan.tokensToAllow.map((t) => t.symbol).join(', ');
-      recentExecutedKeys.add(`whitelist:${report.chain.key}:${tokens}`);
       return {
         action: 'SYNC_WHITELIST',
         chain: report.chain.key,
-        simulated: true,
-        simulationSuccess: true,
+        simulated: false,
+        simulationSuccess: false,
         broadcasted: false,
         txHashes: [],
         explorerUrls: [],
-        summary: `[DRY-RUN SIMULATION] Rencana setTokenAllowed(${tokens}) tervalidasi di ${report.chain.name}. Hubungkan RPC aktif & set AUTO_BROADCAST=true untuk eksekusi on-chain.`,
+        summary: `[OFFLINE EXAMPLE — NOT VALIDATED] Rencana setTokenAllowed(${tokens}) tervalidasi di ${report.chain.name}. Hubungkan RPC aktif & set AUTO_BROADCAST=true untuk eksekusi on-chain.`,
         timestamp,
       };
     }
     if (decision.action === 'EXECUTE_ARBITRAGE' && decision.arbitragePlan) {
       const p = decision.arbitragePlan;
-      recentExecutedKeys.add(`arb:${p.candidateId}`);
       return {
         action: 'EXECUTE_ARBITRAGE',
         chain: report.chain.key,
-        simulated: true,
-        simulationSuccess: true,
+        simulated: false,
+        simulationSuccess: false,
         broadcasted: false,
         txHashes: [],
         explorerUrls: [],
-        summary: `[DRY-RUN SIMULATION] Rencana executeArbitrage(${p.formattedLoanAmount} ${p.loanSymbol} -> ${p.intermediateSymbol} via ${p.firstRouterName}->${p.secondRouterName}, est. net +$${p.expectedNetProfitUsd.toFixed(2)}) tervalidasi.`,
+        summary: `[OFFLINE EXAMPLE — NOT VALIDATED] Rencana executeArbitrage(${p.formattedLoanAmount} ${p.loanSymbol} -> ${p.intermediateSymbol} via ${p.firstRouterName}->${p.secondRouterName}, est. net +$${p.expectedNetProfitUsd.toFixed(2)}) tervalidasi.`,
         timestamp,
       };
     }
     if (decision.action === 'EXECUTE_LIQUIDATION' && decision.liquidationPlan) {
       const p = decision.liquidationPlan;
-      recentExecutedKeys.add(`liq:${p.candidateId}`);
       return {
         action: 'EXECUTE_LIQUIDATION',
         chain: report.chain.key,
-        simulated: true,
-        simulationSuccess: true,
+        simulated: false,
+        simulationSuccess: false,
         broadcasted: false,
         txHashes: [],
         explorerUrls: [],
-        summary: `[DRY-RUN SIMULATION] Rencana executeLiquidation(${p.borrower.slice(0, 10)}…, repay ${p.formattedRepaidAssets} ${p.loanSymbol}, est. net +$${p.expectedNetProfitUsd.toFixed(2)}) tervalidasi.`,
+        summary: `[OFFLINE EXAMPLE — NOT VALIDATED] Rencana executeLiquidation(${p.borrower.slice(0, 10)}…, repay ${p.formattedRepaidAssets} ${p.loanSymbol}, est. net +$${p.expectedNetProfitUsd.toFixed(2)}) tervalidasi.`,
         timestamp,
       };
     }
     if (decision.action === 'EXECUTE_FLASHLOAN' && decision.flashloanPlan) {
       const p = decision.flashloanPlan;
-      recentExecutedKeys.add(`flashloan:${report.chain.key}:${p.symbol}`);
       return {
         action: 'EXECUTE_FLASHLOAN',
         chain: report.chain.key,
-        simulated: true,
-        simulationSuccess: true,
+        simulated: false,
+        simulationSuccess: false,
         broadcasted: false,
         txHashes: [],
         explorerUrls: [],
-        summary: `[DRY-RUN SIMULATION] Rencana flashLoan(${p.formattedAmount}) pada ${report.flashExecutor} tervalidasi.`,
+        summary: `[OFFLINE EXAMPLE — NOT VALIDATED] Rencana flashLoan(${p.formattedAmount}) pada ${report.flashExecutor} tervalidasi.`,
         timestamp,
       };
     }
@@ -330,7 +360,64 @@ export async function executeOperatorDecision(params: {
   const txHashes: Hash[] = [];
   const explorerUrls: string[] = [];
 
+  let realizedGrossProfit: string | undefined;
+  let executionGasCostNative: string | undefined;
+  const collectReceipt = (receipt: Awaited<ReturnType<typeof publicClient.waitForTransactionReceipt>>) => {
+    executionGasCostNative = formatUnits(receipt.gasUsed * receipt.effectiveGasPrice, 18);
+    const decimals = decision.arbitragePlan?.loanDecimals ?? decision.liquidationPlan?.loanDecimals;
+    for (const log of receipt.logs) {
+      if (!report.arbExecutor || log.address.toLowerCase() !== report.arbExecutor.toLowerCase()) continue;
+      try {
+        const decoded = decodeEventLog({ abi: arbExecutorAbi, data: log.data, topics: log.topics });
+        if ('profit' in decoded.args && decimals !== undefined) realizedGrossProfit = formatUnits(decoded.args.profit, decimals);
+      } catch { /* unrelated log */ }
+    }
+  };
+  const waitForReceipt = async ({ hash }: { hash: Hash }) => {
+    if (!txHashes.includes(hash)) {
+      txHashes.push(hash);
+      explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+    }
+    if (executionKey) {
+      if (recentExecutedKeys instanceof ExecutionCooldown) {
+        recentExecutedKeys.markPending(executionKey, async () => {
+          await publicClient.getTransactionReceipt({ hash });
+          return true;
+        });
+      } else recentExecutedKeys.add(executionKey);
+    }
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    collectReceipt(receipt);
+    if (executionKey && recentExecutedKeys instanceof ExecutionCooldown) recentExecutedKeys.markConfirmed(executionKey);
+    return receipt;
+  };
+
+  const prepareProfitGuard = async (profit: bigint, decimals: number, loanToken: Address, estimatedGas: bigint, data: Hex) => {
+    const tokenPriceUsd = report.tokenWhitelists.find(t => t.address.toLowerCase() === loanToken.toLowerCase())?.priceUsd
+      ?? report.profitableLiquidations.find(c => c.marketParams.loanToken.toLowerCase() === loanToken.toLowerCase())?.marketParams.loanPriceUsd;
+    if (!tokenPriceUsd || !Number.isFinite(tokenPriceUsd) || tokenPriceUsd <= 0 || report.nativePriceUsd <= 0) {
+      throw new Error('Fresh token/native USD prices required for net profit validation');
+    }
+    const gasPrice = await publicClient.getGasPrice();
+    if (gasPrice > parseGwei(String(config.maxGasGwei))) throw new Error('Latest gas exceeds MAX_GAS_GWEI');
+    let extraFeeWei = 0n;
+    if (report.chain.key === 'base' || report.chain.key === 'optimism') {
+      const request = { account: account?.address ?? report.arbExecutorOwner!, to: report.arbExecutor!, data,
+        gasPriceOracleAddress: '0x420000000000000000000000000000000000000F' as Address };
+      const [l1, operator] = await Promise.all([estimateL1Fee(publicClient, request), estimateOperatorFee(publicClient, request)]);
+      extraFeeWei = (l1 + operator) * 2n; // conservative reserve; these fees may change before inclusion
+    } else if (!['ethereum', 'arbitrum'].includes(report.chain.key)) {
+      throw new Error('No verified total transaction fee model for this chain');
+    }
+    // Arbitrum eth_estimateGas includes the L1 data component in gas units.
+    return buildNetProfitGuard({ simulatedProfit: profit, decimals, tokenPriceUsd,
+      nativePriceUsd: report.nativePriceUsd, gasPriceWei: gasPrice, estimatedGas, extraFeeWei,
+      minProfitUsd: config.minProfitUsd, profitBribeBps: config.profitBribeBps,
+      maxPriorityFeeGwei: config.maxPriorityFeeGwei, maxGasGwei: config.maxGasGwei });
+  };
+
   try {
+    if (await publicClient.getChainId() !== report.chain.chainId) throw new Error('Executor RPC chain mismatch');
     if (shouldBroadcast) {
       if (!account) {
         throw new Error('PRIVATE_KEY valid wajib diisi di tools/.env untuk mode broadcast');
@@ -379,12 +466,11 @@ export async function executeOperatorDecision(params: {
               functionName: 'setTokenAllowed',
               args: [token.address, true],
             });
-            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            const receipt = await waitForReceipt({ hash });
             if (receipt.status !== 'success') {
               throw new Error(`setTokenAllowed revert untuk ${token.symbol}: ${hash}`);
             }
-            txHashes.push(hash);
-            explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
 
             if (record) {
               const allowedSet = new Set([...(record.allowedAssets ?? []), token.symbol]);
@@ -417,12 +503,11 @@ export async function executeOperatorDecision(params: {
               functionName: 'setTokenAllowed',
               args: [token.address, true],
             });
-            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            const receipt = await waitForReceipt({ hash });
             if (receipt.status !== 'success') {
               throw new Error(`Arb setTokenAllowed revert untuk ${token.symbol}: ${hash}`);
             }
-            txHashes.push(hash);
-            explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
           }
         }
 
@@ -443,12 +528,11 @@ export async function executeOperatorDecision(params: {
               functionName: 'setRouterAllowed',
               args: [router.address, true],
             });
-            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            const receipt = await waitForReceipt({ hash });
             if (receipt.status !== 'success') {
               throw new Error(`Arb setRouterAllowed revert untuk ${router.name}: ${hash}`);
             }
-            txHashes.push(hash);
-            explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
             if (record) {
               const routersSet = new Set([...(record.allowedRouters ?? []), router.address]);
               record.allowedRouters = [...routersSet];
@@ -463,7 +547,7 @@ export async function executeOperatorDecision(params: {
       }
 
       const cooldownKey = `whitelist:${report.chain.key}:${plan.tokensToAllow.map((t) => t.symbol).join(',')}`;
-      recentExecutedKeys.add(cooldownKey);
+      if (txHashes.length > 0) recentExecutedKeys.add(cooldownKey);
 
       return {
         action: 'SYNC_WHITELIST',
@@ -510,12 +594,11 @@ export async function executeOperatorDecision(params: {
           functionName: 'flashLoan',
           args: [plan.token, plan.amount],
         });
-        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        const receipt = await waitForReceipt({ hash });
         if (receipt.status !== 'success') {
           throw new Error(`Flashloan transaksi gagal: ${hash}`);
         }
-        txHashes.push(hash);
-        explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
 
         const registry = await loadDeployments();
         const record = deploymentFor(registry, report.chain.key);
@@ -539,7 +622,7 @@ export async function executeOperatorDecision(params: {
         }
       }
 
-      recentExecutedKeys.add(`flashloan:${report.chain.key}:${plan.symbol}`);
+      if (txHashes.length > 0) recentExecutedKeys.add(`flashloan:${report.chain.key}:${plan.symbol}`);
 
       return {
         action: 'EXECUTE_FLASHLOAN',
@@ -559,7 +642,6 @@ export async function executeOperatorDecision(params: {
     // 3. Handle EXECUTE_ARBITRAGE (Supports V2, V3, and Aerodrome)
     if (decision.action === 'EXECUTE_ARBITRAGE' && decision.arbitragePlan) {
       const plan = decision.arbitragePlan;
-      recentExecutedKeys.add(`arb:${plan.candidateId}`);
 
       if (!report.arbExecutor || !report.arbExecutorOwner) {
         return {
@@ -580,47 +662,8 @@ export async function executeOperatorDecision(params: {
         : report.arbExecutorOwner;
       const deadline = BigInt(Math.floor(Date.now() / 1000) + plan.deadlineSeconds);
 
-      if (plan.autoAllowlistBeforeExec && shouldBroadcast && walletClient && account) {
-        const { tokens: tokensNeeded, routers: routersNeeded } = resolveAutoAllowlistTargets(plan);
-
-        for (const tokenAddr of tokensNeeded) {
-          const isAllowed = await publicClient.readContract({
-            address: report.arbExecutor,
-            abi: arbExecutorAbi,
-            functionName: 'allowedToken',
-            args: [tokenAddr],
-          });
-          if (!isAllowed) {
-            const h = await walletClient.writeContract({
-              address: report.arbExecutor,
-              abi: arbExecutorAbi,
-              functionName: 'setTokenAllowed',
-              args: [tokenAddr, true],
-            });
-            await publicClient.waitForTransactionReceipt({ hash: h });
-            txHashes.push(h);
-            explorerUrls.push(`${report.chain.explorer}/tx/${h}`);
-          }
-        }
-        for (const routerAddr of routersNeeded) {
-          const isAllowed = await publicClient.readContract({
-            address: report.arbExecutor,
-            abi: arbExecutorAbi,
-            functionName: 'allowedRouter',
-            args: [routerAddr],
-          });
-          if (!isAllowed) {
-            const h = await walletClient.writeContract({
-              address: report.arbExecutor,
-              abi: arbExecutorAbi,
-              functionName: 'setRouterAllowed',
-              args: [routerAddr, true],
-            });
-            await publicClient.waitForTransactionReceipt({ hash: h });
-            txHashes.push(h);
-            explorerUrls.push(`${report.chain.explorer}/tx/${h}`);
-          }
-        }
+      if (plan.autoAllowlistBeforeExec) {
+        throw new Error('Allowlist belum siap: sync whitelist sesuai policy, lalu scan ulang sebelum trading');
       }
 
       const isMultiHop = Boolean(plan.isMultiHop && plan.steps && plan.steps.length >= 2);
@@ -668,18 +711,17 @@ export async function executeOperatorDecision(params: {
             abi: arbExecutorAbi,
             functionName: 'executeMultiHopArbitrage',
             args: [multiHopStruct],
-          })
-          .catch(() => 390_000n);
+          });
 
-        const priorityFee = computeDynamicPriorityFee({
-          baseGasPriceWei: report.gasPriceWei,
-          estimatedGasUnits,
-          nativePriceUsd: report.nativePriceUsd,
-          expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
-          minProfitUsd: config.minProfitUsd,
-          profitBribeBps: config.profitBribeBps,
-          maxPriorityFeeGwei: config.maxPriorityFeeGwei,
-        });
+        const priorityFee = await prepareProfitGuard(simulatedProfit, plan.loanDecimals, plan.loanToken,
+          estimatedGasUnits, encodeFunctionData({ abi: arbExecutorAbi, functionName: 'executeMultiHopArbitrage', args: [multiHopStruct] }));
+        multiHopStruct.minProfit = priorityFee.minProfit;
+        // Re-simulate the stricter guard and the exact transaction fee/limit before signing.
+        simulatedProfit = (await publicClient.simulateContract({
+          account: callerAccount, address: report.arbExecutor, abi: arbExecutorAbi,
+          functionName: 'executeMultiHopArbitrage', args: [multiHopStruct], gas: priorityFee.gas,
+          maxFeePerGas: priorityFee.maxFeePerGas, maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
+        })).result;
 
         if (shouldBroadcast && walletClient && account && pk) {
           const bundleEnabled = process.env.MEV_BUNDLE_ENABLED === 'true';
@@ -692,26 +734,29 @@ export async function executeOperatorDecision(params: {
               functionName: 'executeMultiHopArbitrage',
               args: [multiHopStruct],
             });
-            const nonce = await publicClient.getTransactionCount({ address: account.address });
+            const nonce = await publicClient.getTransactionCount({ address: account.address, blockTag: 'pending' });
             const signedRawTx = await walletClient.signTransaction({
               account,
               to: report.arbExecutor,
               data: callData,
-              gas: (estimatedGasUnits * 120n) / 100n,
+              gas: priorityFee.gas,
               maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
               maxFeePerGas: priorityFee.maxFeePerGas,
               nonce,
             });
-            const targetBlockNumber = report.blockNumber + 1n;
+            const targetBlockNumber = await publicClient.getBlockNumber({ cacheTime: 0 }) + 1n;
             const bundleSummary = await submitMevBundleToRelays({
               chainKey: report.chain.key,
-              authPrivateKey: (process.env.FLASHBOTS_AUTH_KEY as Hex | undefined) ?? pk,
+              authPrivateKey: resolveBundleAuthKey(process.env.FLASHBOTS_AUTH_KEY, pk),
               bundle: {
                 txs: [signedRawTx],
                 targetBlockNumber,
               },
             });
             mevBundleHashes.push(...bundleSummary.bundleHashes);
+            if (bundleSummary.relaysAttempted > 0 && bundleSummary.relaysAccepted === 0) {
+              throw new Error('Relay submission not confirmed; public fallback suppressed to avoid leaking a possibly accepted transaction');
+            }
 
             const bundledHash = bundleTxHash(signedRawTx);
             if (
@@ -725,6 +770,7 @@ export async function executeOperatorDecision(params: {
               // second time through a public RPC would publish the private route to the mempool —
               // which is the only thing the relay submission was meant to prevent — so the bundled
               // transaction hash is watched directly instead.
+              recentExecutedKeys.add(`arb:${plan.candidateId}`);
               const inclusion = await awaitBundleInclusion({
                 txHash: bundledHash,
                 targetBlockNumber,
@@ -732,7 +778,8 @@ export async function executeOperatorDecision(params: {
                 getReceipt: async (txHash) => {
                   const receipt = await publicClient
                     .getTransactionReceipt({ hash: txHash })
-                    .catch(() => null);
+                    .catch((error: Error) => { if (error.name === 'TransactionReceiptNotFoundError') return null; throw error; });
+                  if (receipt) { collectReceipt(receipt); if (!txHashes.includes(txHash)) { txHashes.push(txHash); explorerUrls.push(`${report.chain.explorer}/tx/${txHash}`); } }
                   return receipt ? { blockNumber: receipt.blockNumber, status: receipt.status } : null;
                 },
                 getBlockNumber: () => publicClient.getBlockNumber(),
@@ -748,6 +795,19 @@ export async function executeOperatorDecision(params: {
                 throw new Error(`Transaksi Multi-Hop dalam bundle MEV revert: ${bundledHash}`);
               }
 
+              if (inclusion.status === 'unknown') {
+                txHashes.push(bundledHash);
+                explorerUrls.push(`${report.chain.explorer}/tx/${bundledHash}`);
+                if (recentExecutedKeys instanceof ExecutionCooldown) {
+                  recentExecutedKeys.markPending(`arb:${plan.candidateId}`, async () => {
+                    await publicClient.getTransactionReceipt({ hash: bundledHash });
+                    return true;
+                  });
+                }
+                return { action: 'EXECUTE_ARBITRAGE', chain: report.chain.key, simulated: true,
+                  simulationSuccess: true, broadcasted: true, txHashes, explorerUrls, mevBundleHashes,
+                  summary: 'Bundle submitted; inclusion and gas cost unknown because receipt/block tracking was inconclusive. Public fallback suppressed.', timestamp };
+              }
               if (inclusion.status === 'missed') {
                 // Nothing was mined, so nothing was paid for. Re-sending the same nonce publicly
                 // would leak the route and still lose the race, so the cycle simply abstains and
@@ -759,8 +819,7 @@ export async function executeOperatorDecision(params: {
                   `blok terakhir ${inclusion.lastSeenBlockNumber})`;
               } else {
                 bundledTxHash = bundledHash;
-                txHashes.push(bundledHash);
-                explorerUrls.push(`${report.chain.explorer}/tx/${bundledHash}`);
+                recentExecutedKeys.add(`arb:${plan.candidateId}`);
                 mevBundleNote = `dieksekusi via bundle MEV di blok ${inclusion.receipt.blockNumber}`;
               }
             } else {
@@ -785,15 +844,15 @@ export async function executeOperatorDecision(params: {
               abi: arbExecutorAbi,
               functionName: 'executeMultiHopArbitrage',
               args: [multiHopStruct],
+              gas: priorityFee.gas,
               maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
               maxFeePerGas: priorityFee.maxFeePerGas,
             });
-            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            const receipt = await waitForReceipt({ hash });
             if (receipt.status !== 'success') {
               throw new Error(`Transaksi Multi-Hop arbitrase revert: ${hash}`);
             }
-            txHashes.push(hash);
-            explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
           }
 
           if (bundleMissed) {
@@ -848,18 +907,17 @@ export async function executeOperatorDecision(params: {
             abi: arbExecutorAbi,
             functionName: 'executeArbitrage',
             args: [v2Struct],
-          })
-          .catch(() => 280_000n);
+          });
 
-        const priorityFee = computeDynamicPriorityFee({
-          baseGasPriceWei: report.gasPriceWei,
-          estimatedGasUnits,
-          nativePriceUsd: report.nativePriceUsd,
-          expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
-          minProfitUsd: config.minProfitUsd,
-          profitBribeBps: config.profitBribeBps,
-          maxPriorityFeeGwei: config.maxPriorityFeeGwei,
-        });
+        const priorityFee = await prepareProfitGuard(simulatedProfit, plan.loanDecimals, plan.loanToken,
+          estimatedGasUnits, encodeFunctionData({ abi: arbExecutorAbi, functionName: 'executeArbitrage', args: [v2Struct] }));
+        v2Struct.minProfit = priorityFee.minProfit;
+        // Re-simulate the stricter guard and the exact transaction fee/limit before signing.
+        simulatedProfit = (await publicClient.simulateContract({
+          account: callerAccount, address: report.arbExecutor, abi: arbExecutorAbi,
+          functionName: 'executeArbitrage', args: [v2Struct], gas: priorityFee.gas,
+          maxFeePerGas: priorityFee.maxFeePerGas, maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
+        })).result;
 
         if (shouldBroadcast && walletClient && account) {
           const hash = await walletClient.writeContract({
@@ -867,15 +925,15 @@ export async function executeOperatorDecision(params: {
             abi: arbExecutorAbi,
             functionName: 'executeArbitrage',
             args: [v2Struct],
+            gas: priorityFee.gas,
             maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
             maxFeePerGas: priorityFee.maxFeePerGas,
           });
-          const receipt = await publicClient.waitForTransactionReceipt({ hash });
+          const receipt = await waitForReceipt({ hash });
           if (receipt.status !== 'success') {
             throw new Error(`Transaksi arbitrase revert: ${hash}`);
           }
-          txHashes.push(hash);
-          explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
         }
       } else {
         const multiStruct = {
@@ -919,18 +977,17 @@ export async function executeOperatorDecision(params: {
             abi: arbExecutorAbi,
             functionName: 'executeMultiDexArbitrage',
             args: [multiStruct],
-          })
-          .catch(() => 320_000n);
+          });
 
-        const priorityFee = computeDynamicPriorityFee({
-          baseGasPriceWei: report.gasPriceWei,
-          estimatedGasUnits,
-          nativePriceUsd: report.nativePriceUsd,
-          expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
-          minProfitUsd: config.minProfitUsd,
-          profitBribeBps: config.profitBribeBps,
-          maxPriorityFeeGwei: config.maxPriorityFeeGwei,
-        });
+        const priorityFee = await prepareProfitGuard(simulatedProfit, plan.loanDecimals, plan.loanToken,
+          estimatedGasUnits, encodeFunctionData({ abi: arbExecutorAbi, functionName: 'executeMultiDexArbitrage', args: [multiStruct] }));
+        multiStruct.minProfit = priorityFee.minProfit;
+        // Re-simulate the stricter guard and the exact transaction fee/limit before signing.
+        simulatedProfit = (await publicClient.simulateContract({
+          account: callerAccount, address: report.arbExecutor, abi: arbExecutorAbi,
+          functionName: 'executeMultiDexArbitrage', args: [multiStruct], gas: priorityFee.gas,
+          maxFeePerGas: priorityFee.maxFeePerGas, maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
+        })).result;
 
         if (shouldBroadcast && walletClient && account) {
           const hash = await walletClient.writeContract({
@@ -938,15 +995,15 @@ export async function executeOperatorDecision(params: {
             abi: arbExecutorAbi,
             functionName: 'executeMultiDexArbitrage',
             args: [multiStruct],
+            gas: priorityFee.gas,
             maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
             maxFeePerGas: priorityFee.maxFeePerGas,
           });
-          const receipt = await publicClient.waitForTransactionReceipt({ hash });
+          const receipt = await waitForReceipt({ hash });
           if (receipt.status !== 'success') {
             throw new Error(`Transaksi Multi-DEX arbitrase revert: ${hash}`);
           }
-          txHashes.push(hash);
-          explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
         }
       }
 
@@ -961,8 +1018,11 @@ export async function executeOperatorDecision(params: {
         ...(mevBundleHashes.length > 0 ? { mevBundleHashes } : {}),
         txHashes,
         explorerUrls,
+        realizedGrossProfit,
+        simulatedGrossProfit: formattedProfit,
+        executionGasCostNative,
         summary: shouldBroadcast
-          ? `Arbitrase ${plan.loanSymbol}->${plan.intermediateSymbol} berhasil dieksekusi (${broadcastRpcInfo.isPrivate ? 'Private MEV RPC' : 'Standard RPC'})! Realized profit: ${formattedProfit} ${plan.loanSymbol}${mevBundleNote ? ` [MEV: ${mevBundleNote}]` : ''}`
+          ? `Arbitrase ${plan.loanSymbol}->${plan.intermediateSymbol} berhasil dieksekusi (${broadcastRpcInfo.isPrivate ? 'Private MEV RPC' : 'Standard RPC'})! Confirmed gross profit: ${realizedGrossProfit ?? 'unavailable (event missing)'} ${plan.loanSymbol}${mevBundleNote ? ` [MEV: ${mevBundleNote}]` : ''}`
           : `[SIMULATED] Simulasi arbitrase berhasil! Profit on-chain: ${formattedProfit} ${plan.loanSymbol} (~$${plan.expectedNetProfitUsd.toFixed(2)} net).`,
         timestamp,
       };
@@ -971,7 +1031,6 @@ export async function executeOperatorDecision(params: {
     // 4. Handle EXECUTE_LIQUIDATION (Morpho Blue Atomic Liquidation)
     if (decision.action === 'EXECUTE_LIQUIDATION' && decision.liquidationPlan) {
       const plan = decision.liquidationPlan;
-      recentExecutedKeys.add(`liq:${plan.candidateId}`);
 
       if (!report.arbExecutor || !report.arbExecutorOwner) {
         return {
@@ -1025,18 +1084,17 @@ export async function executeOperatorDecision(params: {
         args: [liqStruct],
       });
 
-      const simulatedProfit = simResult.result;
+      let simulatedProfit = simResult.result;
       const formattedProfit = formatUnits(simulatedProfit, plan.loanDecimals);
 
-      const priorityFee = computeDynamicPriorityFee({
-        baseGasPriceWei: report.gasPriceWei,
-        estimatedGasUnits: 350_000n,
-        nativePriceUsd: report.nativePriceUsd,
-        expectedGrossProfitUsd: plan.expectedGrossProfitUsd,
-        minProfitUsd: config.minProfitUsd,
-        profitBribeBps: config.profitBribeBps,
-        maxPriorityFeeGwei: config.maxPriorityFeeGwei,
-      });
+      const gasEstimate = await publicClient.estimateContractGas({ account: callerAccount, address: report.arbExecutor,
+        abi: arbExecutorAbi, functionName: 'executeLiquidation', args: [liqStruct] });
+      const priorityFee = await prepareProfitGuard(simulatedProfit, plan.loanDecimals, plan.loanToken,
+        gasEstimate, encodeFunctionData({ abi: arbExecutorAbi, functionName: 'executeLiquidation', args: [liqStruct] }));
+      liqStruct.minProfit = priorityFee.minProfit;
+      simulatedProfit = (await publicClient.simulateContract({ account: callerAccount, address: report.arbExecutor,
+        abi: arbExecutorAbi, functionName: 'executeLiquidation', args: [liqStruct], gas: priorityFee.gas,
+        maxFeePerGas: priorityFee.maxFeePerGas, maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas })).result;
 
       if (shouldBroadcast && walletClient && account) {
         const hash = await walletClient.writeContract({
@@ -1044,15 +1102,15 @@ export async function executeOperatorDecision(params: {
           abi: arbExecutorAbi,
           functionName: 'executeLiquidation',
           args: [liqStruct],
+          gas: priorityFee.gas,
           maxPriorityFeePerGas: priorityFee.maxPriorityFeePerGas,
           maxFeePerGas: priorityFee.maxFeePerGas,
         });
-        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        const receipt = await waitForReceipt({ hash });
         if (receipt.status !== 'success') {
           throw new Error(`Transaksi likuidasi revert: ${hash}`);
         }
-        txHashes.push(hash);
-        explorerUrls.push(`${report.chain.explorer}/tx/${hash}`);
+
       }
 
       return {
@@ -1065,9 +1123,12 @@ export async function executeOperatorDecision(params: {
         priorityFeeGwei: priorityFee.priorityFeeGwei,
         txHashes,
         explorerUrls,
+        realizedGrossProfit,
+        simulatedGrossProfit: formattedProfit,
+        executionGasCostNative,
         summary: shouldBroadcast
-          ? `Likuidasi posisi ${plan.borrower.slice(0, 10)}… berhasil! Profit: ${formattedProfit} ${plan.loanSymbol}`
-          : `[SIMULATED] Simulasi likuidasi berhasil! Profit: ${formattedProfit} ${plan.loanSymbol} (~$${plan.expectedNetProfitUsd.toFixed(2)} net).`,
+          ? `Likuidasi posisi ${plan.borrower.slice(0, 10)}… berhasil! Confirmed gross profit: ${realizedGrossProfit ?? 'unavailable (event missing)'} ${plan.loanSymbol}`
+          : `[SIMULATED] Simulasi likuidasi berhasil! Confirmed gross profit: ${realizedGrossProfit ?? 'unavailable (event missing)'} ${plan.loanSymbol} (~$${plan.expectedNetProfitUsd.toFixed(2)} net).`,
         timestamp,
       };
     }
@@ -1090,7 +1151,7 @@ export async function executeOperatorDecision(params: {
       chain: report.chain.key,
       simulated: true,
       simulationSuccess: false,
-      broadcasted: false,
+      broadcasted: txHashes.length > 0,
       txHashes,
       explorerUrls,
       summary: `Simulasi/Eksekusi dibatalkan oleh on-chain guard: ${errMsg}`,
@@ -1098,4 +1159,30 @@ export async function executeOperatorDecision(params: {
       timestamp,
     };
   }
+}
+
+/** Reserve the full signed gas budget, not the stale scanner's nominal 280k units. */
+export function buildNetProfitGuard(params: {
+  simulatedProfit: bigint; decimals: number; tokenPriceUsd: number; nativePriceUsd: number;
+  gasPriceWei: bigint; estimatedGas: bigint; extraFeeWei: bigint; minProfitUsd: number;
+  profitBribeBps: number; maxPriorityFeeGwei: number; maxGasGwei: number;
+}) {
+  for (const value of [params.tokenPriceUsd, params.nativePriceUsd, params.minProfitUsd, params.maxGasGwei,
+    params.profitBribeBps, params.maxPriorityFeeGwei]) {
+    if (!Number.isFinite(value) || value < 0) throw new Error('Invalid profit/fee input');
+  }
+  if (params.tokenPriceUsd <= 0 || params.nativePriceUsd <= 0 || params.estimatedGas <= 0n || params.extraFeeWei < 0n) throw new Error('Missing price/gas estimate');
+  const gas = (params.estimatedGas * 150n + 99n) / 100n;
+  const grossUsd = Number(formatUnits(params.simulatedProfit, params.decimals)) * params.tokenPriceUsd;
+  const fee = computeDynamicPriorityFee({ baseGasPriceWei: params.gasPriceWei, estimatedGasUnits: gas,
+    nativePriceUsd: params.nativePriceUsd, expectedGrossProfitUsd: grossUsd,
+    minProfitUsd: params.minProfitUsd + Number(formatUnits(params.extraFeeWei, 18)) * params.nativePriceUsd,
+    profitBribeBps: params.profitBribeBps, maxPriorityFeeGwei: params.maxPriorityFeeGwei });
+  const cap = parseGwei(String(params.maxGasGwei));
+  const maxFeePerGas = fee.maxFeePerGas < cap ? fee.maxFeePerGas : cap;
+  if (maxFeePerGas < params.gasPriceWei + fee.maxPriorityFeePerGas) throw new Error('Fee cap too low for current gas and priority fee');
+  const feeUsd = Number(formatUnits(gas * maxFeePerGas + params.extraFeeWei, 18)) * params.nativePriceUsd;
+  const minProfit = parseUnits(((params.minProfitUsd + feeUsd) / params.tokenPriceUsd).toFixed(params.decimals), params.decimals) + 1n;
+  if (!Number.isFinite(grossUsd) || params.simulatedProfit < minProfit) throw new Error('Latest simulation does not cover net profit plus total fee reserve');
+  return { ...fee, maxFeePerGas, gas, minProfit, feeReserveUsd: feeUsd };
 }

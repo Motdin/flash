@@ -245,3 +245,21 @@ test('summarizeAllowlistOutcomes reports zero failures for a clean run', () => {
   assert.equal(summary.failed, 0);
   assert.deepEqual(summary.failures, []);
 });
+
+test('read failure becomes a per-target outcome and does not abort remaining targets', async () => {
+  let nextRead = false;
+  const result = await allowlistBatch([
+    { label: 'bad-read', address: TOKEN, isAllowed: async () => { throw new Error('RPC unavailable'); }, send: async () => '', confirm: async () => {} },
+    { label: 'next', address: TOKEN_B, isAllowed: async () => { nextRead = true; return true; }, send: async () => '', confirm: async () => {} },
+  ]);
+  assert.equal(nextRead, true);
+  assert.deepEqual(result.outcomes.map(o => o.status), ['failed', 'already-allowed']);
+});
+
+test('read failure during nonce recovery is recorded rather than thrown', async () => {
+  let reads = 0;
+  const result = await allowlistTarget({ label: 'retry-read', address: TOKEN,
+    isAllowed: async () => { if (++reads > 1) throw new Error('RPC unavailable'); return false; },
+    send: async () => { throw new Error('nonce too low'); }, confirm: async () => {}, sleep: noSleep });
+  assert.equal(result.status, 'failed'); assert.match(result.error!, /RPC unavailable/);
+});

@@ -1,3 +1,4 @@
+import { timingSafeEqual, randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { ChainOpportunityReport } from '../morpho/dex-scanner.js';
 import { getAtRiskWatchlist, type MorphoBorrowerWatchlistEntry } from '../morpho/liquidation-scanner.js';
@@ -40,9 +41,6 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload, serializeBigInt, 2);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'Content-Type, Authorization',
     'cache-control': 'no-store',
   });
   res.end(body);
@@ -50,7 +48,10 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of req) {
+    size += Buffer.byteLength(chunk);
+    if (size > 16_384) throw new Error('Request body too large');
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
   }
   const raw = Buffer.concat(chunks).toString('utf8').trim();
@@ -60,12 +61,21 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
 
 function isAuthorized(req: IncomingMessage): boolean {
   const expectedToken = process.env.OPERATOR_API_TOKEN;
-  if (!expectedToken) return true;
+  if (!expectedToken?.trim()) return false;
   const authHeader = req.headers.authorization ?? '';
-  return authHeader === `Bearer ${expectedToken}`;
+  const expected = Buffer.from(`Bearer ${expectedToken}`);
+  const actual = Buffer.from(authHeader);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function renderDashboardHtml(): string {
+export function publicOperatorConfig(config: LlmOperatorConfig) {
+  // Explicit DTO: never serialize credentials or endpoint URLs to clients.
+  return { mode: config.mode, autoBroadcast: config.autoBroadcast, model: config.model,
+    minProfitUsd: config.minProfitUsd, maxGasGwei: config.maxGasGwei,
+    whitelistAutoSync: config.whitelistAutoSync, fastPathEnabled: config.fastPathEnabled };
+}
+
+export function renderDashboardHtml(nonce = randomBytes(18).toString('base64')): string {
   return `<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -212,6 +222,7 @@ function renderDashboardHtml(): string {
 </head>
 <body>
   <div class="container">
+    <div class="controls"><input id="apiToken" type="password" autocomplete="off" placeholder="Operator API token" /><button id="connectBtn">Hubungkan</button><span id="apiError" role="alert"></span></div>
     <header>
       <div class="brand">
         <h1>⚡ MORPHO LLM OPERATOR & EXECUTOR (VPS)</h1>
@@ -219,16 +230,17 @@ function renderDashboardHtml(): string {
       </div>
       <div class="controls">
         <label style="font-size:0.82rem;color:var(--muted);">Mode:
-          <select id="modeSelect" onchange="changeMode()">
+          <select id="modeSelect">
             <option value="dry-run">dry-run (Simulasi)</option>
             <option value="whitelist-only">whitelist-only</option>
             <option value="flashloan">flashloan</option>
             <option value="arbitrage">arbitrage</option>
+          <option value="liquidation">liquidation</option>
             <option value="full">full (Auto Whitelist + Arb + Flash)</option>
           </select>
         </label>
-        <button id="broadcastBtn" onclick="toggleBroadcast()">Broadcast: OFF</button>
-        <button class="primary" id="triggerBtn" onclick="triggerCycle()">↻ Scan & Evaluasi Sekarang</button>
+        <button id="broadcastBtn">Broadcast: OFF</button>
+        <button class="primary" id="triggerBtn">↻ Scan & Evaluasi Sekarang</button>
       </div>
     </header>
 
@@ -314,8 +326,30 @@ function renderDashboardHtml(): string {
     </div>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
+    for (const [id, event, fn] of [['triggerBtn','click',triggerCycle], ['broadcastBtn','click',toggleBroadcast], ['modeSelect','change',changeMode]]) {
+      document.getElementById(id).addEventListener(event, () => { Promise.resolve(fn()).catch(console.error); });
+    }
     let currentState = null;
+    let apiToken = '';
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}[c]));
+    }
+    async function apiFetch(path, options = {}) {
+      const response = await fetch(path, { ...options, headers: { ...options.headers, Authorization: 'Bearer ' + apiToken } });
+      if (!response.ok) {
+        const message = 'HTTP ' + response.status + ': periksa token API dan konfigurasi server';
+        document.getElementById('apiError').textContent = message;
+        throw new Error(message);
+      }
+      document.getElementById('apiError').textContent = '';
+      return response;
+    }
+    document.getElementById('connectBtn').addEventListener('click', () => {
+      apiToken = document.getElementById('apiToken').value;
+      document.getElementById('apiToken').value = '';
+      fetchStatus();
+    });
 
     function actionBadge(action) {
       if (action === 'EXECUTE_ARBITRAGE') return '<span class="badge badge-green">EXECUTE_ARBITRAGE</span>';
@@ -326,7 +360,7 @@ function renderDashboardHtml(): string {
 
     async function fetchStatus() {
       try {
-        const res = await fetch('/api/status');
+        const res = await apiFetch('/api/status');
         if (!res.ok) return;
         const data = await res.json();
         currentState = data;
@@ -341,7 +375,7 @@ function renderDashboardHtml(): string {
         ? '<span class="badge badge-cyan">SCANNING...</span>'
         : '<span class="badge badge-green">ACTIVE / WATCHING</span>';
       document.getElementById('kpiMode').innerHTML =
-        '<span class="badge badge-purple">' + data.config.mode + '</span>';
+        '<span class="badge badge-purple">' + escapeHtml(data.config.mode) + '</span>';
       document.getElementById('kpiModel').textContent = data.config.model || 'deterministic';
       document.getElementById('kpiCycles').textContent = String(data.cycleCount);
       document.getElementById('kpiTargets').textContent =
@@ -365,8 +399,8 @@ function renderDashboardHtml(): string {
         for (const t of (rep.tokenWhitelists || []).slice(0, 8)) {
           wlRows.push(
             '<tr>' +
-              '<td><strong>' + rep.chain.name + '</strong><br/><span style="font-size:0.74rem;color:var(--muted);">Block ' + rep.blockNumber + '</span></td>' +
-              '<td class="mono"><strong>' + t.symbol + '</strong></td>' +
+              '<td><strong>' + escapeHtml(rep.chain.name) + '</strong><br/><span style="font-size:0.74rem;color:var(--muted);">Block ' + escapeHtml(rep.blockNumber) + '</span></td>' +
+              '<td class="mono"><strong>' + escapeHtml(t.symbol) + '</strong></td>' +
               '<td class="mono">$' + Math.round(t.usdValue || 0).toLocaleString() + '</td>' +
               '<td>' + (t.allowedOnFlashExecutor ? '<span class="badge badge-green">WHITELISTED</span>' : '<span class="badge badge-yellow">PENDING</span>') + '</td>' +
               '<td>' + (rep.arbExecutor ? (t.allowedOnArbExecutor ? '<span class="badge badge-green">WHITELISTED</span>' : '<span class="badge badge-yellow">PENDING</span>') : '<span style="color:var(--muted);font-size:0.75rem;">No Arb Contract</span>') + '</td>' +
@@ -386,8 +420,8 @@ function renderDashboardHtml(): string {
           const netColor = c.netProfitUsd >= data.config.minProfitUsd ? 'var(--green)' : (c.netProfitUsd > 0 ? 'var(--yellow)' : 'var(--muted)');
           arbRows.push(
             '<tr>' +
-              '<td><strong>' + rep.chain.name + '</strong><br/><span class="mono" style="font-size:0.78rem;">' + c.loanSymbol + ' → ' + c.intermediateSymbol + '</span></td>' +
-              '<td style="font-size:0.8rem;">' + c.firstRouterName + '<br/>→ ' + c.secondRouterName + '</td>' +
+              '<td><strong>' + escapeHtml(rep.chain.name) + '</strong><br/><span class="mono" style="font-size:0.78rem;">' + escapeHtml(c.loanSymbol) + ' → ' + escapeHtml(c.intermediateSymbol) + '</span></td>' +
+              '<td style="font-size:0.8rem;">' + escapeHtml(c.firstRouterName) + '<br/>→ ' + escapeHtml(c.secondRouterName) + '</td>' +
               '<td class="mono">' + c.spreadBps + ' bps</td>' +
               '<td class="mono" style="color:' + netColor + ';font-weight:600;">$' + Number(c.netProfitUsd).toFixed(2) + '</td>' +
               '<td>' + (c.profitable ? '<span class="badge badge-green">PROFITABLE</span>' : '<span class="badge badge-yellow">MONITOR</span>') + '</td>' +
@@ -409,8 +443,8 @@ function renderDashboardHtml(): string {
         if (errs.length > 0) {
           document.getElementById('historyContainer').innerHTML = errs.map((er) =>
             '<div class="decision-item">' +
-              '<div class="decision-header"><span class="badge badge-red">RPC / SCAN WARNING (' + er.chain + ')</span><span>' + new Date(er.timestamp).toLocaleTimeString() + '</span></div>' +
-              '<div class="decision-reason mono">' + er.message + '</div>' +
+              '<div class="decision-header"><span class="badge badge-red">RPC / SCAN WARNING (' + escapeHtml(er.chain) + ')</span><span>' + new Date(er.timestamp).toLocaleTimeString() + '</span></div>' +
+              '<div class="decision-reason mono">' + escapeHtml(er.message) + '</div>' +
             '</div>'
           ).join('');
         }
@@ -418,11 +452,11 @@ function renderDashboardHtml(): string {
         document.getElementById('historyContainer').innerHTML = history.slice(0, 12).map((item) =>
           '<div class="decision-item">' +
             '<div class="decision-header">' +
-              '<div>' + actionBadge(item.decision.action) + ' <strong style="margin-left:8px;">' + item.chain.toUpperCase() + '</strong> <span style="color:var(--muted);margin-left:6px;">Block ' + item.blockNumber + ' • Gas ' + Number(item.gasPriceGwei).toFixed(3) + ' gwei</span></div>' +
-              '<div style="color:var(--muted);">' + item.decision.source + ' (' + Math.round(item.decision.confidence * 100) + '%) • ' + new Date(item.timestamp).toLocaleTimeString() + '</div>' +
+              '<div>' + actionBadge(item.decision.action) + ' <strong style="margin-left:8px;">' + escapeHtml(item.chain.toUpperCase()) + '</strong> <span style="color:var(--muted);margin-left:6px;">Block ' + escapeHtml(item.blockNumber) + ' • Gas ' + Number(item.gasPriceGwei).toFixed(3) + ' gwei</span></div>' +
+              '<div style="color:var(--muted);">' + escapeHtml(item.decision.source) + ' (' + Math.round(item.decision.confidence * 100) + '%) • ' + new Date(item.timestamp).toLocaleTimeString() + '</div>' +
             '</div>' +
-            '<div class="decision-reason">' + item.decision.reasoning + '</div>' +
-            '<div class="decision-outcome">Outcome: ' + item.outcome.summary + '</div>' +
+            '<div class="decision-reason">' + escapeHtml(item.decision.reasoning) + '</div>' +
+            '<div class="decision-outcome">Outcome: ' + escapeHtml(item.outcome.summary) + '</div>' +
           '</div>'
         ).join('');
       }
@@ -433,7 +467,7 @@ function renderDashboardHtml(): string {
       btn.disabled = true;
       btn.textContent = '↻ Memindai...';
       try {
-        await fetch('/api/trigger', { method: 'POST' });
+        await apiFetch('/api/trigger', { method: 'POST' });
         await fetchStatus();
       } finally {
         btn.disabled = false;
@@ -443,7 +477,7 @@ function renderDashboardHtml(): string {
 
     async function changeMode() {
       const mode = document.getElementById('modeSelect').value;
-      await fetch('/api/mode', {
+      await apiFetch('/api/mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode }),
@@ -454,7 +488,7 @@ function renderDashboardHtml(): string {
     async function toggleBroadcast() {
       if (!currentState) return;
       const next = !currentState.config.autoBroadcast;
-      await fetch('/api/mode', {
+      await apiFetch('/api/mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ autoBroadcast: next }),
@@ -462,8 +496,7 @@ function renderDashboardHtml(): string {
       await fetchStatus();
     }
 
-    fetchStatus();
-    setInterval(fetchStatus, 5000);
+    setInterval(() => { if (apiToken) void fetchStatus(); }, 5000);
   </script>
 </body>
 </html>`;
@@ -476,13 +509,14 @@ export async function startOperatorServer(
 ): Promise<Server> {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
+    if (url.pathname.startsWith('/api/') && !isAuthorized(req)) {
+      sendJson(res, 401, { error: 'Unauthorized: OPERATOR_API_TOKEN required' });
+      return;
+    }
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'Content-Type, Authorization',
-      });
+                  });
       res.end();
       return;
     }
@@ -490,24 +524,14 @@ export async function startOperatorServer(
     if (req.method === 'GET' && url.pathname === '/health') {
       const state = handlers.getState();
       const uptimeSec = Math.floor((Date.now() - new Date(state.startedAt).getTime()) / 1000);
-      sendJson(res, 200, {
-        ok: true,
-        status: state.running ? 'watching' : 'stopped',
-        cycleRunning: state.cycleRunning,
-        cycleCount: state.cycleCount,
-        uptimeSec,
-        mode: state.config.mode,
-        autoBroadcast: state.config.autoBroadcast,
-        llmModel: state.config.model,
-        chains: state.chains,
-      });
+      sendJson(res, state.running ? 200 : 503, { ok: state.running, uptimeSec });
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/status') {
       const state = handlers.getState();
       state.atRiskWatchlist = getAtRiskWatchlist();
-      sendJson(res, 200, state);
+      sendJson(res, 200, { ...state, config: publicOperatorConfig(state.config) });
       return;
     }
 
@@ -525,7 +549,7 @@ export async function startOperatorServer(
         sendJson(res, 401, { error: 'Unauthorized' });
         return;
       }
-      void handlers.triggerNow();
+      void handlers.triggerNow().catch(() => { /* cycle records its own error; no unhandled rejection */ });
       sendJson(res, 202, { ok: true, message: 'Watch cycle triggered' });
       return;
     }
@@ -561,11 +585,11 @@ export async function startOperatorServer(
           }
           patch.autoBroadcast = body.autoBroadcast;
         }
-        if (typeof body.minProfitUsd === 'number' && body.minProfitUsd >= 0) {
+        if (typeof body.minProfitUsd === 'number' && Number.isFinite(body.minProfitUsd) && body.minProfitUsd >= 0) {
           patch.minProfitUsd = body.minProfitUsd;
         }
         handlers.updateConfig(patch);
-        sendJson(res, 200, { ok: true, config: handlers.getState().config });
+        sendJson(res, 200, { ok: true, config: publicOperatorConfig(handlers.getState().config) });
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
@@ -573,9 +597,12 @@ export async function startOperatorServer(
     }
 
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-      const html = renderDashboardHtml();
+      const nonce = randomBytes(18).toString('base64');
+      const html = renderDashboardHtml(nonce);
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`,
+        'x-content-type-options': 'nosniff',
         'cache-control': 'no-store',
       });
       res.end(html);

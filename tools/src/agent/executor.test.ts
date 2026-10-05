@@ -165,3 +165,82 @@ test('empty steps array falls back to the 2-hop field set', () => {
   assert.deepEqual(tokens, [TOKEN_A, TOKEN_B]);
   assert.deepEqual(routers, [ROUTER_1, ROUTER_2]);
 });
+
+import { buildNetProfitGuard, executeOperatorDecision } from './executor.js';
+import { ExecutionCooldown } from './cooldown.js';
+import { loadLlmOperatorConfig, buildArbitragePlan, evaluateDeterministically } from './llm-operator.js';
+import { evmChains } from '../config/chains.js';
+import { evaluateArbitrageQuote, type ChainOpportunityReport } from '../morpho/dex-scanner.js';
+import type { ScannedAsset } from '../morpho/scanner.js';
+
+const feeInput = { simulatedProfit: 100_000_000n, decimals: 6, tokenPriceUsd: 1, nativePriceUsd: 2500,
+  gasPriceWei: 1_000_000_000n, estimatedGas: 400_000n, extraFeeWei: 0n, minProfitUsd: 5,
+  profitBribeBps: 1500, maxPriorityFeeGwei: 15, maxGasGwei: 50 };
+
+test('net-profit guard reserves gas limit, maximum fee and rollup overhead from simulated profit', () => {
+  const result = buildNetProfitGuard(feeInput);
+  assert.equal(result.gas, 600_000n);
+  assert.ok(result.minProfit > 5_000_000n);
+  assert.ok(feeInput.simulatedProfit >= result.minProfit);
+  const extra = buildNetProfitGuard({ ...feeInput, extraFeeWei: 10n ** 15n });
+  assert.ok(extra.minProfit > result.minProfit);
+});
+
+test('profit deterioration, unavailable fee/price and gas caps fail closed', () => {
+  assert.throws(() => buildNetProfitGuard({ ...feeInput, simulatedProfit: 6_000_000n }), /does not cover/);
+  assert.throws(() => buildNetProfitGuard({ ...feeInput, tokenPriceUsd: 0 }), /Missing/);
+  assert.throws(() => buildNetProfitGuard({ ...feeInput, estimatedGas: 0n }), /Missing/);
+  assert.throws(() => buildNetProfitGuard({ ...feeInput, nativePriceUsd: NaN }), /Invalid/);
+  assert.throws(() => buildNetProfitGuard({ ...feeInput, maxGasGwei: 0.1 }), /cap/);
+});
+
+test('submission cooldown expires without a daemon restart', () => {
+  let now = 0;
+  const keys = new ExecutionCooldown(1000, () => now);
+  keys.add('arb:route'); assert.ok(keys.has('arb:route'));
+  now = 1000; assert.equal(keys.has('arb:route'), false); assert.equal(keys.size, 0);
+});
+
+const asset: ScannedAsset = { address: TOKEN_A, symbol: 'A', decimals: 6, balance: 100_000_000_000n,
+  formattedBalance: '100000', priceUsd: 1, priceTimestamp: Math.floor(Date.now()/1000), priceSource: 'morpho-api',
+  usdValue: 100000, eligible: true, sources: [] };
+const route = evaluateArbitrageQuote({ chainKey: 'ethereum', loanAsset: asset,
+  intermediateAsset: { ...asset, address: TOKEN_B, symbol: 'B' },
+  firstRouter: { name: 'R1', address: ROUTER_1, protocol: 'custom-v2', kind: 0, feeBps: 30 },
+  secondRouter: { name: 'R2', address: ROUTER_2, protocol: 'custom-v2', kind: 0, feeBps: 30 },
+  loanAmount: 10_000_000n, loanAmountUsd: 10, intermediateOut: 20_000_000n, finalOut: 100_000_000n,
+  gasCostUsd: 1, minProfitUsd: 5, maxSlippageBps: 30, tokensWhitelistedOnArb: true, routersWhitelistedOnArb: true });
+const executionReport: ChainOpportunityReport = { chain: evmChains[0], blockNumber: 1n, gasPriceWei: 1_000_000_000n,
+  gasPriceGwei: '1', nativePriceUsd: 2500, tokenWhitelists: [], routerWhitelists: [], whitelistedAssets: [],
+  pendingWhitelistAssets: [], pendingWhitelistRouters: [], arbitrageCandidates: [route], profitableCandidates: [route],
+  liquidationCandidates: [], profitableLiquidations: [], warnings: [] };
+
+test('executor refuses unapproved arbitrage before any RPC or transaction', async () => {
+  const config = loadLlmOperatorConfig({ mode: 'arbitrage', autoBroadcast: true, whitelistAutoSync: false });
+  const decision = evaluateDeterministically(executionReport, config);
+  decision.arbitragePlan = buildArbitragePlan({ ...route, tokensWhitelistedOnArb: false }, 120);
+  const outcome = await executeOperatorDecision({ decision,
+    report: { ...executionReport, profitableCandidates: [{ ...route, tokensWhitelistedOnArb: false }] },
+    config, rpcUrl: 'http://127.0.0.1:1', recentExecutedKeys: new Set() });
+  assert.equal(outcome.broadcasted, false); assert.match(outcome.summary, /Policy/);
+});
+
+test('synthetic reports cannot be broadcast even after runtime configuration changes', async () => {
+  const config = loadLlmOperatorConfig({ mode: 'arbitrage', autoBroadcast: true });
+  const decision = evaluateDeterministically(executionReport, config);
+  const outcome = await executeOperatorDecision({ decision, report: { ...executionReport, warnings: ['offline-rpc-simulation: fixture'] },
+    config, rpcUrl: 'http://127.0.0.1:1', recentExecutedKeys: new Set() });
+  assert.equal(outcome.broadcasted, false); assert.match(outcome.summary, /Synthetic/);
+});
+
+test('pending transaction remains locked past TTL and expires only after receipt reconciliation', async () => {
+  let now = 0; let confirmed = false;
+  const keys = new ExecutionCooldown(1000, () => now);
+  keys.markPending('arb:pending', async () => confirmed);
+  now = 100000;
+  await keys.reconcile(); assert.equal(keys.has('arb:pending'), true);
+  keys.add('arb:pending'); now += 1000; assert.equal(keys.has('arb:pending'), true);
+  confirmed = true; await keys.reconcile();
+  assert.equal(keys.has('arb:pending'), true);
+  now += 1000; assert.equal(keys.has('arb:pending'), false);
+});

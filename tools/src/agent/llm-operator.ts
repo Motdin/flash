@@ -247,6 +247,14 @@ function buildWhitelistPlan(
   };
 }
 
+export function canExecuteArbitrageCandidate(
+  report: ChainOpportunityReport, config: LlmOperatorConfig, candidate: ArbitrageCandidate,
+): boolean {
+  // Synchronization is its own policy-controlled action. Never spend allowlist gas
+  // inside a time-sensitive trade or trade a snapshot taken before synchronization.
+  return !report.arbExecutorPaused && candidate.tokensWhitelistedOnArb && candidate.routersWhitelistedOnArb;
+}
+
 export function buildArbitragePlan(
   candidate: ArbitrageCandidate,
   deadlineSeconds: number,
@@ -332,7 +340,7 @@ function buildFlashloanPlan(
   if (asset.priceUsd && asset.priceUsd > 0 && targetUsd > 0) {
     const tokens = targetUsd / asset.priceUsd;
     const precision = Math.min(asset.decimals, 8);
-    const formatted = tokens.toFixed(precision).replace(/\.?0+$/, '') || '1';
+    const formatted = tokens.toFixed(precision) || '1';
     try {
       const parsed = parseUnits(formatted, asset.decimals);
       if (parsed > 0n && parsed <= asset.balance) {
@@ -349,7 +357,7 @@ function buildFlashloanPlan(
     symbol: asset.symbol,
     decimals: asset.decimals,
     amount,
-    formattedAmount: `${numericAmount.toFixed(Math.min(asset.decimals, 6)).replace(/\.?0+$/, '')} ${asset.symbol}`,
+    formattedAmount: `${numericAmount.toFixed(Math.min(asset.decimals, 6))} ${asset.symbol}`,
     usdValue,
     reason,
   };
@@ -393,6 +401,7 @@ export function evaluateDeterministically(
   // Priority 1: Profitable Morpho Blue Liquidation
   const bestLiquidation = (report.profitableLiquidations ?? []).find(
     (liq) =>
+      isActionAllowedByMode('EXECUTE_LIQUIDATION', config.mode) && !report.arbExecutorPaused &&
       liq.netProfitUsd >= config.minProfitUsd &&
       !recentExecutedKeys.has(`liq:${liq.id}`),
   );
@@ -400,6 +409,7 @@ export function evaluateDeterministically(
   // Priority 2: Profitable Multi-DEX Arbitrage
   const bestArbitrage = report.profitableCandidates.find(
     (cand) =>
+      isActionAllowedByMode('EXECUTE_ARBITRAGE', config.mode) && canExecuteArbitrageCandidate(report, config, cand) &&
       cand.netProfitUsd >= config.minProfitUsd &&
       !recentExecutedKeys.has(`arb:${cand.id}`),
   );
@@ -457,7 +467,7 @@ export function evaluateDeterministically(
   // Priority 3: Pending Whitelist Sync (Token or Router)
   const hasPendingWhitelist =
     report.pendingWhitelistAssets.length > 0 || report.pendingWhitelistRouters.length > 0;
-  const whitelistCooldownKey = `whitelist:${report.chain.key}:${report.pendingWhitelistAssets.map((a) => a.symbol).join(',')}`;
+  const whitelistCooldownKey = `whitelist:${report.chain.key}:${report.pendingWhitelistAssets.slice(0, 10).map((a) => a.symbol).join(',')}`;
 
   if (
     config.whitelistAutoSync &&
@@ -590,6 +600,15 @@ export async function evaluateWithLlmOperator(
     }
     throw new Error('LLM_API_KEY wajib diisi untuk mode operator LLM');
   }
+
+  report = { ...report,
+    profitableCandidates: report.profitableCandidates.filter(c =>
+      !recentExecutedKeys.has(`arb:${c.id}`) && canExecuteArbitrageCandidate(report, config, c)),
+    profitableLiquidations: (report.profitableLiquidations ?? []).filter(c =>
+      !report.arbExecutorPaused && !recentExecutedKeys.has(`liq:${c.id}`)),
+    whitelistedAssets: report.whitelistedAssets.filter(a =>
+      !report.flashExecutorPaused && !recentExecutedKeys.has(`flashloan:${report.chain.key}:${a.symbol}`)),
+  };
 
   const stateSummary = {
     chain: {
@@ -864,7 +883,7 @@ Format output WAJIB JSON object tanpa markdown tambahan:
       // Policy Guard: `WHITELIST_AUTO_SYNC=false` must be enforced here too. The system prompt
       // only *asks* the model to consider this flag, so without a hard check a model that
       // ignores it could broadcast allowlist transactions the operator explicitly disabled.
-      if (!config.whitelistAutoSync) {
+      if (!config.whitelistAutoSync || recentExecutedKeys.has(`whitelist:${report.chain.key}:${report.pendingWhitelistAssets.slice(0, 10).map(a => a.symbol).join(',')}`)) {
         return {
           action: 'HOLD',
           confidence,

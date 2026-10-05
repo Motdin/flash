@@ -88,7 +88,6 @@ export async function sendOperatorAlert(entry: OperatorAuditEntry): Promise<void
         body: JSON.stringify({
           chat_id: tgChatId,
           text: textMessage,
-          parse_mode: 'Markdown',
           disable_web_page_preview: true,
         }),
         signal: AbortSignal.timeout(10_000),

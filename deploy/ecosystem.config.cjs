@@ -9,7 +9,7 @@ module.exports = {
   apps: [
     {
       name: 'morpho-llm-operator',
-      cwd: './tools',
+      cwd: require('node:path').resolve(__dirname, '../tools'),
       script: 'node_modules/.bin/tsx',
       args: 'src/commands/watch.ts',
       autorestart: true,

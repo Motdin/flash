@@ -178,7 +178,7 @@ test('awaitBundleInclusion is bounded even when the node never advances its bloc
     sleep: noSleep,
   });
 
-  assert.equal(polls.status, 'missed');
+  assert.equal(polls.status, 'unknown');
   assert.equal(polls.polls, 30, 'maxBlocks * ceil(15s / pollIntervalMs) caps the loop');
 });
 
@@ -194,4 +194,45 @@ test('maxBlocks below one is clamped so a misconfigured env cannot skip the wait
 
   assert.equal(result.status, 'missed');
   assert.equal(result.polls, 1);
+});
+
+import { resolveBundleAuthKey, resolveMevBundleRelays, submitMevBundleToRelays } from './mev-bundle.js';
+
+test('blank auth uses validated fallback; malformed and zero keys are rejected', () => {
+  const fixture = `0x${'11'.repeat(32)}` as const;
+  assert.equal(resolveBundleAuthKey(' ', fixture), fixture);
+  assert.equal(resolveBundleAuthKey(undefined, fixture), fixture);
+  assert.throws(() => resolveBundleAuthKey('bad', fixture));
+  assert.throws(() => resolveBundleAuthKey(`0x${'00'.repeat(32)}`, fixture));
+});
+
+test('global mainnet relays are not used for Base/Arbitrum bundles', () => {
+  const saved = process.env.MEV_BUNDLE_RELAYS;
+  process.env.MEV_BUNDLE_RELAYS = 'https://fixture.invalid';
+  try {
+    assert.deepEqual(resolveMevBundleRelays('ethereum'), ['https://fixture.invalid']);
+    assert.deepEqual(resolveMevBundleRelays('base'), []);
+    assert.deepEqual(resolveMevBundleRelays('arbitrum'), []);
+  } finally { if (saved === undefined) delete process.env.MEV_BUNDLE_RELAYS; else process.env.MEV_BUNDLE_RELAYS = saved; }
+});
+
+test('relay acceptance requires a valid JSON-RPC bundle hash', async () => {
+  const saved = globalThis.fetch;
+  const submit = () => submitMevBundleToRelays({ chainKey: 'ethereum', authPrivateKey: `0x${'11'.repeat(32)}`,
+    relayUrls: ['https://fixture.invalid'], bundle: { txs: ['0x00'], targetBlockNumber: 1n } });
+  try {
+    for (const body of ['{}', 'not JSON', '{"result":null}', '{"result":{"bundleHash":"bad"}}']) {
+      globalThis.fetch = async () => new Response(body);
+      assert.equal((await submit()).relaysAccepted, 0);
+    }
+    globalThis.fetch = async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { bundleHash: `0x${'ab'.repeat(32)}` } }));
+    assert.equal((await submit()).relaysAccepted, 1);
+  } finally { globalThis.fetch = saved; }
+});
+
+test('RPC receipt failure after target block is unknown, not a zero-gas miss', async () => {
+  const result = await awaitBundleInclusion({ txHash: `0x${'ab'.repeat(32)}`, targetBlockNumber: 1n,
+    getReceipt: async () => { throw new Error('RPC unavailable'); }, getBlockNumber: async () => 10n, sleep: noSleep });
+  assert.equal(result.status, 'unknown');
+  assert.equal(resolveBundleBroadcastDecision({ bundleEnabled: true, relaysAttempted: 1, relaysAccepted: 1, inclusion: result.status }).action, 'bundle-only');
 });

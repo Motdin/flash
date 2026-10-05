@@ -6,14 +6,17 @@ import {
   getAddress,
   http,
   parseAbiItem,
+  parseAbi,
+  type PublicClient,
   parseUnits,
 } from 'viem';
 import type { EvmChainConfig } from '../config/chains.js';
 import type { DexRouterConfig } from '../config/dex-routers.js';
-import type { Address } from '../config/registry.js';
-import { applySlippageBps } from './dex-scanner.js';
+import { morphoForChain, type Address } from '../config/registry.js';
+import type { ScannedAsset } from './scanner.js';
+import { applySlippageBps, readSingleRouterQuote } from './dex-scanner.js';
 
-const MORPHO_BLUE_SINGLETON = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as Address;
+
 
 const MORPHO_APIS = [
   'https://blue-api.morpho.org/graphql',
@@ -86,6 +89,10 @@ export function upsertWatchlistEntry(entry: MorphoBorrowerWatchlistEntry): void 
 }
 
 export function getAtRiskWatchlist(chainKey?: string): MorphoBorrowerWatchlistEntry[] {
+  const cutoff = Date.now() - 5 * 60_000;
+  for (const [key, entry] of watchlistMemory) {
+    if (!Number.isFinite(Date.parse(entry.updatedAt)) || Date.parse(entry.updatedAt) < cutoff) watchlistMemory.delete(key);
+  }
   const all = [...watchlistMemory.values()];
   const filtered = chainKey ? all.filter((item) => item.chain === chainKey) : all;
   return filtered.sort((a, b) => a.healthFactor - b.healthFactor || b.borrowUsd - a.borrowUsd);
@@ -181,12 +188,14 @@ export function evaluateLiquidationCandidate(params: {
     maxSlippageBps,
   } = params;
 
-  if (borrowUsd <= 0 || collateralUsd <= 0) return null;
+  const watchKey = `${chainKey}:${market.marketId}:${borrower.toLowerCase()}`;
+  if (borrowUsd <= 0 || collateralUsd <= 0) { watchlistMemory.delete(watchKey); return null; }
   const lltvRatio = Number(market.lltv) / Number(WAD);
   const maxBorrowUsd = collateralUsd * lltvRatio;
   const healthFactor = maxBorrowUsd / borrowUsd;
 
   const status = classifyHealthFactorStatus(healthFactor);
+  if (status === 'healthy') watchlistMemory.delete(watchKey);
   if (status !== 'healthy') {
     upsertWatchlistEntry({
       key: `${chainKey}:${market.marketId}:${borrower.toLowerCase()}`,
@@ -224,15 +233,15 @@ export function evaluateLiquidationCandidate(params: {
   const outTokensFloat = expectedOutUsd / Math.max(0.000001, market.loanPriceUsd);
 
   const repaidAssets = parseUnits(
-    repayTokensFloat.toFixed(Math.min(market.loanDecimals, 6)).replace(/\.?0+$/, '') || '1',
+    repayTokensFloat.toFixed(Math.min(market.loanDecimals, 6)) || '1',
     market.loanDecimals,
   );
   const seizedAssets = parseUnits(
-    seizedTokensFloat.toFixed(Math.min(market.collateralDecimals, 6)).replace(/\.?0+$/, '') || '1',
+    seizedTokensFloat.toFixed(Math.min(market.collateralDecimals, 6)) || '1',
     market.collateralDecimals,
   );
   const expectedLoanTokenOut = parseUnits(
-    outTokensFloat.toFixed(Math.min(market.loanDecimals, 6)).replace(/\.?0+$/, '') || '1',
+    outTokensFloat.toFixed(Math.min(market.loanDecimals, 6)) || '1',
     market.loanDecimals,
   );
 
@@ -243,14 +252,14 @@ export function evaluateLiquidationCandidate(params: {
   const requiredProfitUsd = Math.max(0, minProfitUsd + gasCostUsd);
   const requiredProfitTokens = requiredProfitUsd / Math.max(0.000001, market.loanPriceUsd);
   const minProfit = parseUnits(
-    requiredProfitTokens.toFixed(Math.min(market.loanDecimals, 6)).replace(/\.?0+$/, '') || '1',
+    requiredProfitTokens.toFixed(Math.min(market.loanDecimals, 6)) || '1',
     market.loanDecimals,
   );
 
   const profitable = grossProfit >= minProfit && netProfitUsd >= minProfitUsd;
 
   return {
-    id: `liq:${chainKey}:${market.collateralSymbol}->${market.loanSymbol}:${borrower.slice(0, 8)}`,
+    id: `liq:${chainKey}:${market.marketId.toLowerCase()}:${borrower.toLowerCase()}`,
     chain: chainKey,
     marketParams: market,
     borrower,
@@ -318,7 +327,7 @@ export async function discoverOnChainMorphoBorrowers(params: {
     const head = await client.getBlockNumber();
     const fromBlock = head > blockLookback ? head - blockLookback : 0n;
     const logs = await client.getLogs({
-      address: MORPHO_BLUE_SINGLETON,
+      address: await morphoForChain(chain.key),
       event: borrowEventAbi,
       fromBlock,
       toBlock: head,
@@ -344,6 +353,7 @@ export async function discoverOnChainMorphoBorrowers(params: {
 export async function scanMorphoLiquidations(params: {
   chain: EvmChainConfig;
   rpcUrl?: string;
+  assets?: ScannedAsset[];
   routers: DexRouterConfig[];
   gasCostUsd: number;
   minProfitUsd: number;
@@ -356,6 +366,8 @@ export async function scanMorphoLiquidations(params: {
   const bestRouter = sortedRouters[0];
 
   const candidates: LiquidationCandidate[] = [];
+  const discovered = new Map<string, { marketId: `0x${string}`; borrower: Address }>();
+  const discover = (marketId: `0x${string}`, borrower: Address) => discovered.set(`${marketId}:${borrower.toLowerCase()}`, { marketId, borrower });
 
   // 1. Check custom / manual liquidation candidates from MORPHO_LIQUIDATION_CANDIDATES_JSON if configured
   const rawManual = process.env.MORPHO_LIQUIDATION_CANDIDATES_JSON;
@@ -379,18 +391,7 @@ export async function scanMorphoLiquidations(params: {
           irm: getAddress(item.market.irm) as Address,
           lltv: BigInt(item.market.lltv),
         };
-        const cand = evaluateLiquidationCandidate({
-          chainKey: chain.key,
-          market: marketConfig,
-          borrower: getAddress(item.borrower) as Address,
-          borrowUsd: item.borrowUsd,
-          collateralUsd: item.collateralUsd,
-          swapRouter: bestRouter,
-          gasCostUsd,
-          minProfitUsd,
-          maxSlippageBps,
-        });
-        if (cand) candidates.push(cand);
+        discover(marketConfig.marketId, getAddress(item.borrower) as Address);
       }
     } catch {
       // Ignore malformed manual JSON
@@ -462,21 +463,7 @@ export async function scanMorphoLiquidations(params: {
           lltv: BigInt(m.lltv ?? '860000000000000000'),
         };
 
-        const candidate = evaluateLiquidationCandidate({
-          chainKey: chain.key,
-          market: marketConfig,
-          borrower: getAddress(item.user.address) as Address,
-          borrowUsd: item.borrowAssetsUsd ?? 0,
-          collateralUsd: item.collateralUsd ?? 0,
-          swapRouter: bestRouter,
-          gasCostUsd,
-          minProfitUsd,
-          maxSlippageBps,
-        });
-
-        if (candidate) {
-          candidates.push(candidate);
-        }
+        discover(marketConfig.marketId, getAddress(item.user.address) as Address);
       }
       break;
     } catch {
@@ -486,13 +473,119 @@ export async function scanMorphoLiquidations(params: {
 
   // 3. Optionally index recent on-chain Borrow events if RPC is provided
   if (rpcUrl && process.env.ONCHAIN_BORROW_INDEXER_ENABLED === 'true') {
-    await discoverOnChainMorphoBorrowers({ chain, rpcUrl });
+    for (const entry of await discoverOnChainMorphoBorrowers({ chain, rpcUrl })) discover(entry.marketId, entry.borrower);
   }
 
-  if (watchlistMemory.size > 0) {
+  // Recheck previous borrowers as well, including positions no longer returned by the API.
+  for (const entry of getAtRiskWatchlist(chain.key)) discover(entry.marketId, entry.borrower);
+  if (rpcUrl) {
+    const client = createPublicClient({ transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 0 }) });
+    if (await client.getChainId() !== chain.chainId) throw new Error('Liquidation RPC chain mismatch');
+    const morpho = await morphoForChain(chain.key);
+    for (const entry of discovered.values()) {
+      try {
+        const candidate = await quoteVerifiedLiquidation({ client, morpho, chainKey: chain.key,
+          ...entry, assets: params.assets ?? [], routers, gasCostUsd, minProfitUsd, maxSlippageBps });
+        if (candidate) candidates.push(candidate);
+      } catch {
+        // No verified position / fresh prices / executable quote means no execution candidate.
+      }
+    }
+  }
+
+  // Also persist an empty list after positions recover; never resurrect stale entries on restart.
+  {
     await persistWatchlistToDisk();
   }
 
   candidates.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
   return candidates;
+}
+
+const positionAbi = parseAbi([
+  'function idToMarketParams(bytes32) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)',
+  'function accrueInterest((address loanToken,address collateralToken,address oracle,address irm,uint256 lltv) marketParams)',
+  'function market(bytes32) view returns (uint128 totalSupplyAssets,uint128 totalSupplyShares,uint128 totalBorrowAssets,uint128 totalBorrowShares,uint128 lastUpdate,uint128 fee)',
+  'function position(bytes32,address) view returns (uint256 supplyShares,uint128 borrowShares,uint128 collateral)',
+]);
+const oracleAbi = parseAbi(['function price() view returns (uint256)']);
+const ceilDiv = (n: bigint, d: bigint) => (n + d - 1n) / d;
+
+/** Integer rounding matches the seized-assets branch of Morpho Blue liquidate(). */
+export function liquidationRepayment(seized: bigint, oraclePrice: bigint, lif: bigint, totalAssets: bigint, totalShares: bigint): bigint {
+  const quotedAssets = ceilDiv(ceilDiv(seized * oraclePrice, 10n ** 36n) * WAD, lif);
+  const shares = ceilDiv(quotedAssets * (totalShares + 1_000_000n), totalAssets + 1n);
+  return ceilDiv(shares * (totalAssets + 1n), totalShares + 1_000_000n);
+}
+
+export async function quoteVerifiedLiquidation(params: {
+  client: PublicClient; morpho: Address; chainKey: string; marketId: `0x${string}`; borrower: Address;
+  assets: ScannedAsset[]; routers: DexRouterConfig[]; gasCostUsd: number; minProfitUsd: number; maxSlippageBps: number;
+}): Promise<LiquidationCandidate | null> {
+  const { client, morpho, marketId, borrower, chainKey } = params;
+  const key = `${chainKey}:${marketId}:${borrower.toLowerCase()}`;
+  const [loanToken, collateralToken, oracle, irm, lltv] = await client.readContract({
+    address: morpho, abi: positionAbi, functionName: 'idToMarketParams', args: [marketId],
+  });
+  if (lltv <= 0n || lltv >= WAD) return null;
+  const marketParams = { loanToken, collateralToken, oracle, irm, lltv };
+  // One eth_call: accrue interest transiently, then read updated debt and oracle in the same state.
+  const snapshot = await client.multicall({ allowFailure: false,
+    multicallAddress: '0xcA11bde05977b3631167028862bE2a173976CA11', batchSize: 0,
+    contracts: [
+      { address: morpho, abi: positionAbi, functionName: 'accrueInterest', args: [marketParams] },
+      { address: morpho, abi: positionAbi, functionName: 'market', args: [marketId] },
+      { address: morpho, abi: positionAbi, functionName: 'position', args: [marketId, borrower] },
+      { address: oracle, abi: oracleAbi, functionName: 'price' },
+    ],
+  });
+  const [, , totalBorrowAssets, totalBorrowShares] = snapshot[1];
+  const [, borrowShares, collateral] = snapshot[2];
+  const oraclePrice = snapshot[3];
+  if (borrowShares === 0n || collateral === 0n) { watchlistMemory.delete(key); return null; }
+  if (oraclePrice <= 0n) return null;
+  const debt = ceilDiv(borrowShares * (totalBorrowAssets + 1n), totalBorrowShares + 1_000_000n);
+  const maxBorrow = (collateral * oraclePrice / (10n ** 36n)) * lltv / WAD;
+  const healthFactor = Number(maxBorrow) / Number(debt);
+  if (healthFactor > 1.12) { watchlistMemory.delete(key); return null; }
+  const freshAsset = (address: Address) => params.assets.find(a => a.address.toLowerCase() === address.toLowerCase()
+    && a.priceUsd !== null && Number.isFinite(a.priceUsd) && a.priceUsd > 0 && a.priceTimestamp !== null
+    && Date.now() / 1000 - a.priceTimestamp <= 3600 && a.priceTimestamp <= Date.now() / 1000 + 300);
+  const loan = freshAsset(loanToken);
+  const coll = freshAsset(collateralToken);
+  if (!loan || !coll) return null;
+  const market: MorphoMarketParamsConfig = { marketId, ...marketParams, loanSymbol: loan.symbol,
+    loanDecimals: loan.decimals, loanPriceUsd: loan.priceUsd!, collateralSymbol: coll.symbol,
+    collateralDecimals: coll.decimals, collateralPriceUsd: coll.priceUsd! };
+  upsertWatchlistEntry({ key, chain: chainKey, borrower, marketId, loanSymbol: loan.symbol,
+    collateralSymbol: coll.symbol, borrowUsd: Number(formatUnits(debt, loan.decimals)) * loan.priceUsd!,
+    collateralUsd: Number(formatUnits(collateral, coll.decimals)) * coll.priceUsd!, healthFactor,
+    status: classifyHealthFactorStatus(healthFactor) as 'liquidatable' | 'critical' | 'at-risk',
+    source: 'onchain-events', updatedAt: new Date().toISOString(), marketParams: market });
+  if (maxBorrow >= debt) return null;
+  const rawLif = WAD * WAD / (WAD - (3n * 10n ** 17n) * (WAD - lltv) / WAD);
+  const lif = rawLif < 115n * 10n ** 16n ? rawLif : 115n * 10n ** 16n;
+  const halfDebtSeizure = (debt / 2n) * lif / WAD * (10n ** 36n) / oraclePrice;
+  const seizedAssets = halfDebtSeizure < collateral ? halfDebtSeizure : collateral;
+  if (seizedAssets === 0n) return null;
+  const repaidAssets = liquidationRepayment(seizedAssets, oraclePrice, lif, totalBorrowAssets, totalBorrowShares);
+  let best: { router: DexRouterConfig; output: bigint } | undefined;
+  for (const router of params.routers) {
+    const output = await readSingleRouterQuote(client, { router, amountIn: seizedAssets, tokenIn: collateralToken, tokenOut: loanToken });
+    if (output > (best?.output ?? 0n)) best = { router, output };
+  }
+  if (!best) return null;
+  const grossProfit = best.output - repaidAssets;
+  const grossProfitUsd = Number(formatUnits(grossProfit, loan.decimals)) * loan.priceUsd!;
+  const minProfit = parseUnits(((params.minProfitUsd + params.gasCostUsd) / loan.priceUsd!).toFixed(loan.decimals), loan.decimals) + 1n;
+  const requiredOut = repaidAssets + minProfit;
+  const slippageOut = applySlippageBps(best.output, params.maxSlippageBps);
+  return { id: `liq:${chainKey}:${marketId.toLowerCase()}:${borrower.toLowerCase()}`, chain: chainKey,
+    marketParams: market, borrower, healthFactor, seizedAssets, formattedSeizedAssets: formatUnits(seizedAssets, coll.decimals),
+    repaidAssets, formattedRepaidAssets: formatUnits(repaidAssets, loan.decimals),
+    repaidUsd: Number(formatUnits(repaidAssets, loan.decimals)) * loan.priceUsd!, incentiveBps: Number(lif * 10000n / WAD),
+    swapRouter: best.router, expectedLoanTokenOut: best.output, minLoanTokenOut: slippageOut > requiredOut ? slippageOut : requiredOut,
+    grossProfit, formattedGrossProfit: formatUnits(grossProfit, loan.decimals), grossProfitUsd,
+    estimatedGasCostUsd: params.gasCostUsd, netProfitUsd: grossProfitUsd - params.gasCostUsd,
+    minProfit, profitable: grossProfit >= minProfit && grossProfitUsd - params.gasCostUsd >= params.minProfitUsd };
 }

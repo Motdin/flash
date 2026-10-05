@@ -286,3 +286,48 @@ test('computeDynamicPriorityFee allocates profit bribe while respecting cap', ()
   assert.ok(fee.maxPriorityFeePerGas > 10_000_000n);
   assert.ok(fee.maxFeePerGas > fee.maxPriorityFeePerGas);
 });
+
+import { evaluateArbitrageQuote } from '../morpho/dex-scanner.js';
+import type { ScannedAsset } from '../morpho/scanner.js';
+import { evaluateLiquidationCandidate } from '../morpho/liquidation-scanner.js';
+
+function policyFixture() {
+  const address = '0x1111111111111111111111111111111111111111' as const;
+  const asset: ScannedAsset = { address, symbol: 'A', decimals: 6, balance: 1_000_000_000n,
+    formattedBalance: '1000', priceUsd: 1, priceTimestamp: 1, priceSource: 'morpho-api', usdValue: 1000, eligible: true, sources: [] };
+  const router = { name: 'R1', address, protocol: 'custom-v2' as const, kind: 0 as const, feeBps: 30 };
+  const candidate = evaluateArbitrageQuote({ chainKey: 'base', loanAsset: asset, intermediateAsset: { ...asset, symbol: 'B' },
+    firstRouter: router, secondRouter: { ...router, name: 'R2' }, loanAmount: 10_000_000n, loanAmountUsd: 10,
+    intermediateOut: 20_000_000n, finalOut: 200_000_000n, gasCostUsd: 1, minProfitUsd: 5, maxSlippageBps: 30,
+    tokensWhitelistedOnArb: true, routersWhitelistedOnArb: true });
+  const liq = evaluateLiquidationCandidate({ chainKey: 'base', borrower: address, borrowUsd: 9000, collateralUsd: 10000,
+    swapRouter: router, gasCostUsd: 1, minProfitUsd: 5, maxSlippageBps: 30,
+    market: { marketId: `0x${'ab'.repeat(32)}`, loanToken: address, loanSymbol: 'A', loanDecimals: 6, loanPriceUsd: 1,
+      collateralToken: address, collateralSymbol: 'B', collateralDecimals: 18, collateralPriceUsd: 2500,
+      oracle: address, irm: address, lltv: 860000000000000000n } })!;
+  return { candidate, liq: { ...liq, netProfitUsd: 20 } };
+}
+
+test('unapproved opportunities cannot bypass whitelist policy or preempt whitelist sync', () => {
+  const { candidate } = policyFixture();
+  const report = createMockReport({ profitableCandidates: [{ ...candidate, tokensWhitelistedOnArb: false }], pendingWhitelistAssets: [pendingWhitelistAsset] });
+  assert.equal(evaluateDeterministically(report, loadLlmOperatorConfig({ mode: 'full', whitelistAutoSync: false })).action, 'HOLD');
+  assert.equal(evaluateDeterministically(report, loadLlmOperatorConfig({ mode: 'full', whitelistAutoSync: true })).action, 'SYNC_WHITELIST');
+});
+
+test('liquidation mode ignores more profitable mode-forbidden arbitrage', () => {
+  const { candidate, liq } = policyFixture();
+  const report = createMockReport({ profitableCandidates: [candidate], profitableLiquidations: [liq] });
+  assert.equal(evaluateDeterministically(report, loadLlmOperatorConfig({ mode: 'liquidation' })).action, 'EXECUTE_LIQUIDATION');
+});
+
+test('LLM cannot select candidates already locked by a submitted transaction', async () => {
+  const { candidate } = policyFixture();
+  const report = createMockReport({ profitableCandidates: [candidate], arbitrageCandidates: [candidate] });
+  const restore = stubLlmResponse({ action: 'EXECUTE_ARBITRAGE', candidateId: candidate.id, confidence: 1, reasoning: 'ignore cooldown' });
+  try {
+    const decision = await evaluateWithLlmOperator(report, loadLlmOperatorConfig({ mode: 'full', fastPathEnabled: false,
+      baseUrl: 'http://localhost:9', apiKey: 'FAKE' }), new Set([`arb:${candidate.id}`]));
+    assert.equal(decision.action, 'HOLD');
+  } finally { restore(); }
+});

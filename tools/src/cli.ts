@@ -385,6 +385,7 @@ async function deployExecutor(
   morpho: Address,
   selected: ScannedAsset[],
 ): Promise<{ executor: Address; hash: Hash; block: bigint; gasUsed: bigint }> {
+  await compileContracts(); // Never deploy a stale artifact after a source update.
   let artifactRaw: string;
   try {
     artifactRaw = await readFile(artifactPath, 'utf8');
@@ -575,7 +576,7 @@ function parseRequestedAmount(raw: string, asset: ScannedAsset): { amount: bigin
     if (!asset.priceUsd || asset.priceUsd <= 0) throw new Error(`harga ${asset.symbol} tidak tersedia`);
     const tokenAmount = usdTarget / asset.priceUsd;
     const precision = Math.min(asset.decimals, 12);
-    const formatted = tokenAmount.toFixed(precision).replace(/\.?0+$/, '');
+    const formatted = tokenAmount.toFixed(precision);
     return { amount: parseUnits(formatted, asset.decimals), usdTarget };
   }
   return { amount: parseUnits(value, asset.decimals) };
@@ -855,7 +856,14 @@ async function setupArb(args: ParsedArgs): Promise<void> {
     const tokenSummary = await runAllowlistBatch('Token', tokenTargets);
     const routerSummary = await runAllowlistBatch('Router', routerTargets);
 
-    record.allowedRouters = routers.map((r) => r.address);
+    const confirmedRouters: string[] = [];
+    for (const router of routers) {
+      if (await publicClient.readContract({ address: registeredArb, abi: arbAbi,
+        functionName: 'allowedRouter', args: [router.address] }).catch(() => false)) {
+        confirmedRouters.push(router.address);
+      }
+    }
+    record.allowedRouters = [...new Set(confirmedRouters)];
     registry[result.chain.key] = record;
     await saveDeployments(registry);
 
@@ -863,13 +871,14 @@ async function setupArb(args: ParsedArgs): Promise<void> {
     if (failures.length > 0) {
       const names = failures.map((f) => f.label).join(', ');
       throw new Error(
-        `${failures.length} target gagal di-allowlist (transaksi tidak terkirim, gas tidak terpakai): ${names}. ` +
+        `${failures.length} target gagal di-allowlist (periksa receipt; transaksi mungkin terkirim dan gas mungkin terpakai): ${names}. ` +
           'State yang berhasil sudah disimpan — jalankan ulang perintah yang sama untuk melanjutkan (target yang sudah ter-whitelist otomatis dilewati).',
       );
     }
     return;
   }
 
+  await compileContracts(); // Never deploy a stale artifact after a source update.
   let artifactRaw: string;
   try {
     artifactRaw = await readFile(arbArtifactPath, 'utf8');

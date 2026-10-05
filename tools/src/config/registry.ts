@@ -46,3 +46,9 @@ export function deploymentFor(registry: DeploymentRegistry, chainKey: string): D
 export async function saveDeployments(registry: DeploymentRegistry): Promise<void> {
   await writeFile(deploymentsPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
 }
+
+export async function morphoForChain(chainKey: string): Promise<Address> {
+  const record = deploymentFor(await loadDeployments(), chainKey);
+  if (!record?.morpho) throw new Error(`Morpho deployment missing for ${chainKey}`);
+  return record.morpho;
+}

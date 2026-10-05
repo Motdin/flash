@@ -11,6 +11,8 @@ import {
 import type { EvmChainConfig } from '../config/chains.js';
 import {
   decodeCurveIndices,
+  routerSupportsPair,
+  type CustomDexRouter,
   getRoutersForChain,
   type DexRouterConfig,
   type RouterKindId,
@@ -181,7 +183,7 @@ export type OpportunityScanOptions = {
   maxSlippageBps?: number;
   maxAssetsToPair?: number;
   enableTriangularArb?: boolean;
-  extraRouters?: Array<{ name?: string; address: string; feeBps?: number; kind?: RouterKindId; v3FeeTier?: number }>;
+  extraRouters?: CustomDexRouter[];
 };
 
 export function applySlippageBps(amount: bigint, slippageBps: number): bigint {
@@ -309,17 +311,20 @@ export function computeLoanAmountForUsd(
     return { amount: 0n, actualUsd: 0 };
   }
   const desiredTokens = targetUsd / asset.priceUsd;
-  const precision = Math.min(asset.decimals, 8);
-  const formatted = desiredTokens.toFixed(precision).replace(/\.?0+$/, '') || '0';
+  const precision = Math.min(asset.decimals, 100);
+  if (!Number.isFinite(desiredTokens) || !Number.isInteger(asset.decimals) || asset.decimals < 0
+      || !Number.isFinite(maxPoolShareBps) || maxPoolShareBps <= 0 || maxPoolShareBps > 10000) return { amount: 0n, actualUsd: 0 };
+  const formatted = desiredTokens.toFixed(precision);
   let requested = 0n;
   try {
     requested = parseUnits(formatted, asset.decimals);
   } catch {
     requested = 0n;
   }
+  if (requested <= 0n) return { amount: 0n, actualUsd: 0 };
   const maxPoolAmount = (asset.balance * BigInt(maxPoolShareBps)) / 10_000n;
-  const cap = maxPoolAmount > 0n ? maxPoolAmount : asset.balance;
-  const finalAmount = requested > 0n && requested <= cap ? requested : cap;
+  const cap = maxPoolAmount;
+  const finalAmount = requested <= cap ? requested : cap;
   const actualTokens = Number(formatUnits(finalAmount, asset.decimals));
   return {
     amount: finalAmount,
@@ -394,7 +399,7 @@ export function evaluateArbitrageQuote(params: {
     const requiredUsd = Math.max(0, minProfitUsd + gasCostUsd);
     const reqTokens = requiredUsd / loanAsset.priceUsd;
     const precision = Math.min(loanAsset.decimals, 8);
-    const formatted = reqTokens.toFixed(precision).replace(/\.?0+$/, '') || '0';
+    const formatted = reqTokens.toFixed(precision) || '0';
     try {
       const parsed = parseUnits(formatted, loanAsset.decimals);
       if (parsed > 0n) requiredProfitUnits = parsed;
@@ -441,7 +446,7 @@ export function evaluateArbitrageQuote(params: {
   ];
 
   return {
-    id: `${chainKey}:${loanAsset.symbol}->${intermediateAsset.symbol}@${firstRouter.name}->${secondRouter.name}($${Math.round(loanAmountUsd)})`,
+    id: `${chainKey}:${loanAsset.address.toLowerCase()}:${intermediateAsset.address.toLowerCase()}:${firstRouter.address.toLowerCase()}:${firstRouter.kind}:${firstRouter.v3FeeTier ?? 0}:${firstRouter.aeroStable ?? false}:${secondRouter.address.toLowerCase()}:${secondRouter.kind}:${secondRouter.v3FeeTier ?? 0}:${secondRouter.aeroStable ?? false}:${loanAmount}`,
     chain: chainKey,
     loanToken: loanAsset.address,
     loanSymbol: loanAsset.symbol,
@@ -535,7 +540,7 @@ export function evaluateMultiHopArbitrageQuote(params: {
     const requiredUsd = Math.max(0, minProfitUsd + multiHopGasCostUsd);
     const reqTokens = requiredUsd / loanAsset.priceUsd;
     const precision = Math.min(loanAsset.decimals, 8);
-    const formatted = reqTokens.toFixed(precision).replace(/\.?0+$/, '') || '0';
+    const formatted = reqTokens.toFixed(precision) || '0';
     try {
       const parsed = parseUnits(formatted, loanAsset.decimals);
       if (parsed > 0n) requiredProfitUnits = parsed;
@@ -631,14 +636,12 @@ function inferNativePriceUsd(chain: EvmChainConfig, assets: ScannedAsset[]): num
     const sym = asset.symbol.toUpperCase();
     return (
       asset.priceUsd &&
-      asset.priceUsd > 0 &&
+      asset.priceUsd > 0 && asset.priceTimestamp !== null && Date.now() / 1000 - asset.priceTimestamp <= 3600 &&
       (sym === nativeUpper || sym === `W${nativeUpper}` || (nativeUpper === 'ETH' && sym === 'WETH'))
     );
   });
   if (wrappedMatch?.priceUsd) return wrappedMatch.priceUsd;
-  if (nativeUpper === 'ETH') return 2500;
-  if (nativeUpper.includes('USD')) return 1;
-  return 10;
+  return 0; // Unknown price: executor refuses trading rather than inventing a gas price in USD.
 }
 
 type QuoteCallRequest = {
@@ -648,12 +651,31 @@ type QuoteCallRequest = {
   tokenOut: Address;
 };
 
-async function readSingleRouterQuote(
+export async function readSingleRouterQuote(
   client: PublicClient,
   req: QuoteCallRequest,
 ): Promise<bigint> {
   const { router, amountIn, tokenIn, tokenOut } = req;
+  if (!routerSupportsPair(router, tokenIn, tokenOut)) return 0n;
   try {
+    if (router.kind === 5) {
+      if (!router.quoterAddress) return 0n;
+      const abi = parseAbi(['function token0() view returns (address)', 'function token1() view returns (address)', 'function fee() view returns (uint24)']);
+      const [token0, token1, fee] = await Promise.all([
+        client.readContract({ address: router.address, abi, functionName: 'token0' }),
+        client.readContract({ address: router.address, abi, functionName: 'token1' }),
+        client.readContract({ address: router.address, abi, functionName: 'fee' }),
+      ]);
+      if (!([token0.toLowerCase(), token1.toLowerCase()].includes(tokenIn.toLowerCase())
+        && [token0.toLowerCase(), token1.toLowerCase()].includes(tokenOut.toLowerCase()))) return 0n;
+      return readSingleRouterQuote(client, { ...req, router: { ...router, kind: 2, v3FeeTier: fee } });
+    }
+    if (router.kind === 4) {
+      const { i, j } = decodeCurveIndices(router.v3FeeTier ?? 1);
+      const abi = parseAbi(['function coins(uint256) view returns (address)']);
+      const [coinIn, coinOut] = await Promise.all([i, j].map(index => client.readContract({ address: router.address, abi, functionName: 'coins', args: [BigInt(index)] })));
+      if (coinIn.toLowerCase() !== tokenIn.toLowerCase() || coinOut.toLowerCase() !== tokenOut.toLowerCase()) return 0n;
+    }
     if ((router.kind === 1 || router.kind === 2) && router.quoterAddress) {
       const res = await client.readContract({
         address: router.quoterAddress,
@@ -719,6 +741,15 @@ async function batchReadMultiDexQuotes(
   calls: QuoteCallRequest[],
 ): Promise<bigint[]> {
   if (calls.length === 0) return [];
+  if (calls.some(c => c.router.kind === 4 || c.router.kind === 5)) {
+    const normal = calls.filter(c => c.router.kind !== 4 && c.router.kind !== 5);
+    const outputs = await batchReadMultiDexQuotes(client, normal);
+    let index = 0;
+    const result: bigint[] = [];
+    for (const call of calls) result.push(call.router.kind === 4 || call.router.kind === 5
+      ? await readSingleRouterQuote(client, call) : outputs[index++]);
+    return result;
+  }
   try {
     const contracts = calls.map((req) => {
       const { router, amountIn, tokenIn, tokenOut } = req;
@@ -1236,7 +1267,8 @@ export async function scanChainOpportunities(
   const liquidationCandidates = await scanMorphoLiquidations({
     chain: options.chain,
     rpcUrl: options.rpcUrl,
-    routers: activeRouters.length > 0 ? activeRouters : configuredRouters,
+    routers: activeRouters,
+    assets: options.assets,
     gasCostUsd: estimatedGasCostUsd,
     minProfitUsd,
     maxSlippageBps,

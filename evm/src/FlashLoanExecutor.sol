@@ -82,7 +82,12 @@ contract FlashLoanExecutor is IMorphoFlashLoanCallback {
         // Reserved callback slot. No DEX or arbitrary external calls are performed.
         if (IERC20(token).balanceOf(address(this)) < assets) revert RepaymentInvariant();
         // Morpho pulls the exact principal after this callback returns.
-        if (!IERC20(token).approve(morpho, assets)) revert TokenApprovalFailed();
+        if (!_callOptionalReturn(token, abi.encodeCall(IERC20.approve, (morpho, assets)))) {
+            if (!_callOptionalReturn(token, abi.encodeCall(IERC20.approve, (morpho, 0)))
+                || !_callOptionalReturn(token, abi.encodeCall(IERC20.approve, (morpho, assets)))) {
+                revert TokenApprovalFailed();
+            }
+        }
         loanActive = false;
         activeToken = address(0);
         activeAssets = 0;
@@ -102,6 +107,13 @@ contract FlashLoanExecutor is IMorphoFlashLoanCallback {
 
     /// @dev Recover tokens accidentally sent to the executor; owner-only and never called by callback.
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {
-        if (to == address(0) || !IERC20(token).transfer(to, amount)) revert TokenTransferFailed();
+        if (loanActive || to == address(0)
+            || !_callOptionalReturn(token, abi.encodeCall(IERC20.transfer, (to, amount)))) revert TokenTransferFailed();
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) private returns (bool) {
+        if (token.code.length == 0) return false;
+        (bool success, bytes memory result) = token.call(data);
+        return success && (result.length == 0 || (result.length == 32 && abi.decode(result, (bool))));
     }
 }

@@ -57,8 +57,16 @@ export async function buildFlashbotsSignatureHeader(
   };
 }
 
+export function resolveBundleAuthKey(raw: string | undefined, fallback: Hex): Hex {
+  const value = raw?.trim() || fallback;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) throw new Error('Invalid FLASHBOTS_AUTH_KEY');
+  privateKeyToAccount(value as Hex); // reject zero/out-of-range scalar too
+  return value as Hex;
+}
+
 export function resolveMevBundleRelays(chainKey: string): string[] {
-  const customEnv = process.env.MEV_BUNDLE_RELAYS;
+  const customEnv = process.env[`${chainKey.toUpperCase()}_MEV_BUNDLE_RELAYS`]
+    ?? (chainKey === 'ethereum' ? process.env.MEV_BUNDLE_RELAYS : undefined);
   if (customEnv && customEnv.trim().length > 0) {
     return customEnv
       .split(',')
@@ -160,11 +168,10 @@ export async function submitMevBundleToRelays(params: {
             ? parsed.result
             : parsed.result?.bundleHash;
 
-        return {
-          relayUrl,
-          accepted: true,
-          bundleHash,
-        };
+        if (typeof bundleHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(bundleHash)) {
+          return { relayUrl, accepted: false, error: 'Invalid JSON-RPC bundle result (acceptance unknown)' };
+        }
+        return { relayUrl, accepted: true, bundleHash };
       } catch (err) {
         return {
           relayUrl,
@@ -217,7 +224,7 @@ export function shouldWaitForBundle(params: {
   return params.bundleEnabled && params.relaysAccepted > 0;
 }
 
-export type BundleInclusionStatus = 'not-checked' | 'included-success' | 'included-reverted' | 'missed';
+export type BundleInclusionStatus = 'not-checked' | 'included-success' | 'included-reverted' | 'missed' | 'unknown';
 
 export type BundleBroadcastAction = 'public-broadcast' | 'bundle-only' | 'abstain-zero-gas';
 
@@ -291,7 +298,8 @@ export type BundleReceiptLite = {
 
 export type BundleInclusionResult =
   | { status: 'included-success' | 'included-reverted'; receipt: BundleReceiptLite; polls: number }
-  | { status: 'missed'; lastSeenBlockNumber: bigint; polls: number };
+  | { status: 'missed'; lastSeenBlockNumber: bigint; polls: number }
+  | { status: 'unknown'; lastSeenBlockNumber: bigint; polls: number };
 
 /**
  * Waits for the bundled transaction to be mined, bounded by blocks rather than a fixed
@@ -326,7 +334,9 @@ export async function awaitBundleInclusion(params: {
   let lastSeenBlockNumber = 0n;
 
   for (let poll = 1; poll <= maxPolls; poll++) {
-    const receipt = await params.getReceipt(params.txHash).catch(() => null);
+    lastSeenBlockNumber = await params.getBlockNumber().catch(() => lastSeenBlockNumber);
+    let receiptReadFailed = false;
+    const receipt = await params.getReceipt(params.txHash).catch(() => { receiptReadFailed = true; return null; });
     if (receipt) {
       return {
         status: receipt.status === 'success' ? 'included-success' : 'included-reverted',
@@ -334,12 +344,11 @@ export async function awaitBundleInclusion(params: {
         polls: poll,
       };
     }
-    lastSeenBlockNumber = await params.getBlockNumber().catch(() => lastSeenBlockNumber);
     if (lastSeenBlockNumber >= deadlineBlock) {
-      return { status: 'missed', lastSeenBlockNumber, polls: poll };
+      return { status: receiptReadFailed ? 'unknown' : 'missed', lastSeenBlockNumber, polls: poll };
     }
     if (poll < maxPolls) await sleep(pollIntervalMs);
   }
 
-  return { status: 'missed', lastSeenBlockNumber, polls: maxPolls };
+  return { status: 'unknown', lastSeenBlockNumber, polls: maxPolls };
 }

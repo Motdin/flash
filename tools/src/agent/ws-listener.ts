@@ -9,7 +9,7 @@ const CHAIN_WSS_ENV_KEYS: Record<string, string[]> = {
   optimism: ['OP_WSS_URL', 'OPTIMISM_WSS_URL'],
 };
 
-const MORPHO_BLUE_SINGLETON = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as Address;
+
 
 const morphoBorrowEvent = parseAbiItem(
   'event Borrow(bytes32 indexed id, address caller, address indexed onBehalf, address indexed receiver, uint256 assets, uint256 shares)',
@@ -56,6 +56,7 @@ export function resolveChainWssUrl(chainKey: string): {
  */
 export function startMultiChainWsListeners(params: {
   chains: EvmChainConfig[];
+  morphoAddresses: Record<string, Address>;
   minTriggerIntervalMs?: number;
   onChainTrigger: (chain: EvmChainConfig, triggerSource: string, blockNumber?: bigint) => void;
 }): WsBlockListenerHandle {
@@ -119,8 +120,10 @@ export function startMultiChainWsListeners(params: {
       });
       unwatchers.push(unwatchBlocks);
 
+      const morpho = params.morphoAddresses[chain.key];
+      if (!morpho) continue;
       const unwatchMorpho = wsClient.watchEvent({
-        address: MORPHO_BLUE_SINGLETON,
+        address: morpho,
         event: morphoBorrowEvent,
         onLogs: (logs) => {
           if (logs.length === 0) return;

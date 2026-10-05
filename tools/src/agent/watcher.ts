@@ -1,3 +1,4 @@
+import { ExecutionCooldown } from './cooldown.js';
 import { getAddress, parseUnits } from 'viem';
 import { evmChains, type EvmChainConfig } from '../config/chains.js';
 import { getRoutersForChain } from '../config/dex-routers.js';
@@ -351,7 +352,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
   }
 
   const maxConsecutiveFailures = Number(process.env.MAX_CONSECUTIVE_FAILURES ?? '3');
-  const recentExecutedKeys = new Set<string>();
+  const recentExecutedKeys = new ExecutionCooldown(Number(process.env.EXECUTION_COOLDOWN_MS ?? '60000'));
   const runtimeState: OperatorRuntimeState = {
     startedAt: new Date().toISOString(),
     running: true,
@@ -383,6 +384,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
         loadStablecoins(),
       ]);
 
+      await recentExecutedKeys.reconcile();
       for (const chain of selectedChains) {
         if (!runtimeState.running) break;
         const record = deploymentFor(deployments, chain.key);
@@ -431,7 +433,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
           } catch (rpcErr) {
             if (
               runtimeState.config.autoBroadcast ||
-              process.env.SIMULATION_OFFLINE_FALLBACK === 'false'
+              process.env.SIMULATION_OFFLINE_FALLBACK !== 'true'
             ) {
               throw rpcErr;
             }
@@ -581,9 +583,12 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
   if (!options.once && process.env.WSS_STREAM_ENABLED !== 'false') {
     wsListener = startMultiChainWsListeners({
       chains: selectedChains,
+      morphoAddresses: Object.fromEntries(Object.entries(await loadDeployments())
+        .filter(([, value]) => typeof value.morpho === 'string' && value.morpho)
+        .map(([key, value]) => [key, value.morpho as Address])),
       onChainTrigger: (_chain, _source) => {
         if (!runtimeState.cycleRunning && runtimeState.running) {
-          void executeSingleCycle();
+          void executeSingleCycle().catch(err => { ui.warning(`Watch cycle: ${String(err)}`); });
         }
       },
     });
@@ -635,6 +640,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
   }
 
   let timer: NodeJS.Timeout | undefined;
+  let wakeSleep: (() => void) | undefined;
   const shutdown = (signal: string): void => {
     if (!runtimeState.running) return;
     runtimeState.running = false;
@@ -642,6 +648,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
       ui.info(`Menerima sinyal ${signal}, menghentikan VPS LLM Operator dengan aman...`);
     }
     if (timer) clearTimeout(timer);
+    wakeSleep?.();
     if (wsListener) {
       wsListener.stop();
     }
@@ -661,6 +668,7 @@ export async function runWatchDaemon(options: WatchDaemonOptions = {}): Promise<
 
   while (runtimeState.running) {
     await new Promise<void>((resolve) => {
+      wakeSleep = resolve;
       timer = setTimeout(resolve, intervalSec * 1000);
     });
     if (!runtimeState.running) break;
