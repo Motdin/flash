@@ -24,6 +24,7 @@ import {
 } from '../config/registry.js';
 import type { ChainOpportunityReport } from '../morpho/dex-scanner.js';
 import type {
+  ArbitrageExecutionPlan,
   LlmOperatorConfig,
   OperatorActionType,
   OperatorDecision,
@@ -173,6 +174,43 @@ function getValidPrivateKey(): Hex | undefined {
   const raw = process.env.PRIVATE_KEY;
   if (!raw || !/^0x[0-9a-fA-F]{64}$/.test(raw)) return undefined;
   return raw as Hex;
+}
+
+/**
+ * Resolves the complete set of on-chain allowlist targets (`allowedToken` + `allowedRouter`)
+ * required to execute an arbitrage plan on `MorphoAtomicArbPOC`.
+ *
+ * A 2-hop plan only touches `loanToken`/`intermediateToken` and the first/second router, but an
+ * N-hop (triangular) plan validates `allowedToken[step.tokenOut]` and `allowedRouter[step.router]`
+ * for *every* hop. Whitelisting just the first/last hop therefore makes `executeMultiHopArbitrage`
+ * revert with `TokenNotAllowed` / `RouterNotAllowed`. All targets are de-duplicated
+ * case-insensitively (first occurrence wins) so repeated hops never emit redundant transactions.
+ */
+export function resolveAutoAllowlistTargets(plan: ArbitrageExecutionPlan): {
+  tokens: Address[];
+  routers: Address[];
+} {
+  const steps = plan.steps && plan.steps.length > 0 ? plan.steps : undefined;
+  const tokenCandidates = steps
+    ? [plan.loanToken, ...steps.map((s) => s.tokenOut)]
+    : [plan.loanToken, plan.intermediateToken];
+  const routerCandidates = steps
+    ? steps.map((s) => s.router)
+    : [plan.firstRouter, plan.secondRouter];
+
+  const dedupe = (addresses: Address[]): Address[] => {
+    const seen = new Set<string>();
+    const unique: Address[] = [];
+    for (const addr of addresses) {
+      const key = addr.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(addr);
+    }
+    return unique;
+  };
+
+  return { tokens: dedupe(tokenCandidates), routers: dedupe(routerCandidates) };
 }
 
 export async function executeOperatorDecision(params: {
@@ -537,7 +575,9 @@ export async function executeOperatorDecision(params: {
       const deadline = BigInt(Math.floor(Date.now() / 1000) + plan.deadlineSeconds);
 
       if (plan.autoAllowlistBeforeExec && shouldBroadcast && walletClient && account) {
-        for (const tokenAddr of [plan.loanToken, plan.intermediateToken]) {
+        const { tokens: tokensNeeded, routers: routersNeeded } = resolveAutoAllowlistTargets(plan);
+
+        for (const tokenAddr of tokensNeeded) {
           const isAllowed = await publicClient.readContract({
             address: report.arbExecutor,
             abi: arbExecutorAbi,
@@ -556,7 +596,7 @@ export async function executeOperatorDecision(params: {
             explorerUrls.push(`${report.chain.explorer}/tx/${h}`);
           }
         }
-        for (const routerAddr of [plan.firstRouter, plan.secondRouter]) {
+        for (const routerAddr of routersNeeded) {
           const isAllowed = await publicClient.readContract({
             address: report.arbExecutor,
             abi: arbExecutorAbi,
