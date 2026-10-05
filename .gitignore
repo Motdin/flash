@@ -11,3 +11,10 @@ evm/broadcast/
 # OS/editor files
 .DS_Store
 *.log
+
+# Atomic deployment-registry writer state
+evm/deployments.json.lock/
+evm/deployments.json.tmp-*
+
+# Local operator logs and verification scratch files
+tools/logs/

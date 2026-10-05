@@ -9,7 +9,6 @@ import { resolveChainWssUrl } from '../agent/ws-listener.js';
 import {
   decodeCurveIndices,
   encodeCurveIndices,
-  getRoutersForChain,
 } from '../config/dex-routers.js';
 import {
   applySlippageBps,
@@ -301,25 +300,69 @@ test('resolveChainWssUrl detects standard WSS and Base Flashblocks WSS URLs', ()
   delete process.env.BASE_FLASHBLOCKS_WSS_URL;
 });
 
+import { getRoutersForChain, routerSupportsPair } from '../config/dex-routers.js';
+import { readSingleRouterQuote } from './dex-scanner.js';
+import type { PublicClient } from 'viem';
 
-test('custom direct V3 pool config preserves its matching QuoterV2 address', () => {
-  const originalRouters = process.env.CUSTOM_DEX_ROUTERS_JSON;
-  process.env.CUSTOM_DEX_ROUTERS_JSON = JSON.stringify({
-    customchain: [{
-      name: 'V3 direct pool',
-      address: '0x1111111111111111111111111111111111111111',
-      kind: 5,
-      v3FeeTier: 3000,
-      quoterAddress: '0x2222222222222222222222222222222222222222',
-    }],
-  });
-  try {
-    const [router] = getRoutersForChain('customchain');
-    assert.equal(router.kind, 5);
-    assert.equal(router.v3FeeTier, 3000);
-    assert.equal(router.quoterAddress?.toLowerCase(), '0x2222222222222222222222222222222222222222');
-  } finally {
-    if (originalRouters === undefined) delete process.env.CUSTOM_DEX_ROUTERS_JSON;
-    else process.env.CUSTOM_DEX_ROUTERS_JSON = originalRouters;
-  }
+test('small/unrepresentable USD targets do not expand into half the pool', () => {
+  const result = computeLoanAmountForUsd({ balance: 1000n * 10n ** 18n, decimals: 18, priceUsd: 1e12 }, 1);
+  assert.equal(result.amount, 1_000_000n); // 1e-12 token, not 500 tokens
+  assert.equal(result.actualUsd, 1);
+  assert.equal(computeLoanAmountForUsd({ balance: 1000n, decimals: 0, priceUsd: 1000 }, 1).amount, 0n);
+  assert.equal(computeLoanAmountForUsd({ balance: 1000n, decimals: 0, priceUsd: 1 }, 100).amount, 100n);
+  assert.equal(computeLoanAmountForUsd(mockUsdc, NaN).amount, 0n);
+});
+
+test('custom V3/Aero fields survive registry normalization and incomplete adapters are rejected', () => {
+  const address = '0x1111111111111111111111111111111111111111' as const;
+  const quoter = '0x2222222222222222222222222222222222222222' as const;
+  const list = getRoutersForChain('fixture', [
+    { address, kind: 2, quoterAddress: quoter, v3FeeTier: 500 },
+    { address, kind: 3, factoryAddress: quoter, aeroStable: true },
+    { address, kind: 3, factoryAddress: quoter, aeroStable: false },
+  ]);
+  assert.equal(list.length, 3); assert.equal(list[0].quoterAddress, quoter);
+  assert.equal(list[1].factoryAddress, quoter); assert.equal(list[1].aeroStable, true);
+  assert.throws(() => getRoutersForChain('fixture', [{ address, kind: 2 }]), /quoterAddress/);
+  assert.throws(() => getRoutersForChain('fixture', [{ address, kind: 4 }]), /curveCoins/);
+});
+
+test('Curve quotes never reinterpret unrelated/reversed token amounts as configured pool direction', async () => {
+  const pool = { name: 'Curve', address: mockUsdc.address, protocol: 'curve' as const, kind: 4 as const,
+    feeBps: 1, v3FeeTier: encodeCurveIndices(0,1), curveCoins: [mockUsdc.address, mockWeth.address] };
+  assert.equal(routerSupportsPair(pool, mockUsdc.address, mockWeth.address), true);
+  assert.equal(routerSupportsPair(pool, mockWeth.address, mockUsdc.address), false);
+  let calls = 0;
+  const client = { readContract: async () => { calls++; return 1n; } } as unknown as PublicClient;
+  assert.equal(await readSingleRouterQuote(client, { router: pool, amountIn: 1n, tokenIn: mockCbBtc.address, tokenOut: mockWeth.address }), 0n);
+  assert.equal(calls, 0);
+});
+
+test('direct V3 pool uses the matching pool tokens/fee and Quoter, never getAmountsOut', async () => {
+  const methods: string[] = [];
+  const client = { readContract: async (request: { functionName: string }) => {
+    methods.push(request.functionName);
+    if (request.functionName === 'token0') return mockUsdc.address;
+    if (request.functionName === 'token1') return mockWeth.address;
+    if (request.functionName === 'fee') return 500;
+    if (request.functionName === 'quoteExactInputSingle') return [123n, 0n, 0, 0n];
+    throw new Error('unexpected ABI');
+  } } as unknown as PublicClient;
+  assert.equal(await readSingleRouterQuote(client, { router: { name: 'pool', address: mockCbBtc.address,
+    protocol: 'v3-direct-pool', kind: 5, feeBps: 5, quoterAddress: mockWeth.address },
+    amountIn: 1n, tokenIn: mockUsdc.address, tokenOut: mockWeth.address }), 123n);
+  assert.ok(!methods.includes('getAmountsOut'));
+});
+
+test('healthy/repaid borrowers are removed from the watchlist', () => {
+  clearWatchlistMemory();
+  const params = { chainKey: 'base', market: { marketId: `0x${'aa'.repeat(32)}` as const,
+    loanToken: mockUsdc.address, loanSymbol: 'USDC', loanDecimals: 6, loanPriceUsd: 1,
+    collateralToken: mockWeth.address, collateralSymbol: 'WETH', collateralDecimals: 18, collateralPriceUsd: 2500,
+    oracle: mockUsdc.address, irm: mockWeth.address, lltv: 860000000000000000n }, borrower: mockCbBtc.address,
+    borrowUsd: 9000, collateralUsd: 10000, swapRouter: getRoutersForChain('base')[0], gasCostUsd: 1, minProfitUsd: 5, maxSlippageBps: 30 };
+  evaluateLiquidationCandidate(params); assert.equal(getAtRiskWatchlist().length, 1);
+  evaluateLiquidationCandidate({ ...params, borrowUsd: 1000 }); assert.equal(getAtRiskWatchlist().length, 0);
+  evaluateLiquidationCandidate(params);
+  evaluateLiquidationCandidate({ ...params, borrowUsd: 0 }); assert.equal(getAtRiskWatchlist().length, 0);
 });

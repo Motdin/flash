@@ -257,7 +257,7 @@ async function askLlmFromTelegram(
           },
           {
             role: 'user',
-            content: `Data On-Chain Saat Ini:\n${JSON.stringify(contextSnapshot)}\n\nPertanyaan Operator: ${question}`,
+            content: `Data On-Chain Saat Ini:\n${JSON.stringify(contextSnapshot, (_key, value) => typeof value === 'bigint' ? value.toString() : value)}\n\nPertanyaan Operator: ${question}`,
           },
         ],
       }),
@@ -359,7 +359,7 @@ export async function handleTelegramCommand(
     }
 
     case 'profit': {
-      const num = Number(arg);
+      const num = arg.trim() ? Number(arg) : NaN;
       if (!Number.isFinite(num) || num < 0) {
         return {
           reply: `⚠️ Masukkan angka USD yang valid, contoh: \`/profit 10\``,
@@ -417,7 +417,6 @@ export function startTelegramBotController(handlers: TelegramControllerHandlers)
         body: JSON.stringify({
           chat_id: targetChatId,
           text,
-          parse_mode: 'Markdown',
           disable_web_page_preview: true,
           ...(showMenu
             ? {

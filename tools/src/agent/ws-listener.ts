@@ -10,6 +10,7 @@ const CHAIN_WSS_ENV_KEYS: Record<string, string[]> = {
 };
 
 
+
 const morphoBorrowEvent = parseAbiItem(
   'event Borrow(bytes32 indexed id, address caller, address indexed onBehalf, address indexed receiver, uint256 assets, uint256 shares)',
 );
@@ -55,13 +56,12 @@ export function resolveChainWssUrl(chainKey: string): {
  */
 export function startMultiChainWsListeners(params: {
   chains: EvmChainConfig[];
-  morphoAddresses?: Record<string, Address | undefined>;
+  morphoAddresses: Record<string, Address>;
   minTriggerIntervalMs?: number;
   onChainTrigger: (chain: EvmChainConfig, triggerSource: string, blockNumber?: bigint) => void;
 }): WsBlockListenerHandle {
   const {
     chains,
-    morphoAddresses = {},
     minTriggerIntervalMs = Number(process.env.MIN_WS_TRIGGER_INTERVAL_MS ?? '1500'),
     onChainTrigger,
   } = params;
@@ -120,25 +120,24 @@ export function startMultiChainWsListeners(params: {
       });
       unwatchers.push(unwatchBlocks);
 
-      const morphoAddress = morphoAddresses[chain.key];
-      if (morphoAddress) {
-        const unwatchMorpho = wsClient.watchEvent({
-          address: morphoAddress,
-          event: morphoBorrowEvent,
-          onLogs: (logs) => {
-            if (logs.length === 0) return;
-            const st = statuses[chain.key];
-            st.connected = true;
-            st.eventsReceived += logs.length;
-            st.lastEventAt = new Date().toISOString();
-            maybeTrigger('morpho-borrow-event', logs[0].blockNumber ?? undefined);
-          },
-          onError: () => {
-            // Non-fatal if eth_subscribe logs is restricted on basic WSS endpoint
-          },
-        });
-        unwatchers.push(unwatchMorpho);
-      }
+      const morpho = params.morphoAddresses[chain.key];
+      if (!morpho) continue;
+      const unwatchMorpho = wsClient.watchEvent({
+        address: morpho,
+        event: morphoBorrowEvent,
+        onLogs: (logs) => {
+          if (logs.length === 0) return;
+          const st = statuses[chain.key];
+          st.connected = true;
+          st.eventsReceived += logs.length;
+          st.lastEventAt = new Date().toISOString();
+          maybeTrigger('morpho-borrow-event', logs[0].blockNumber ?? undefined);
+        },
+        onError: () => {
+          // Non-fatal if eth_subscribe logs is restricted on basic WSS endpoint
+        },
+      });
+      unwatchers.push(unwatchMorpho);
     } catch (err) {
       statuses[chain.key].lastError = err instanceof Error ? err.message : String(err);
     }

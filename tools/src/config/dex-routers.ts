@@ -36,7 +36,29 @@ export type DexRouterConfig = {
   /** For Aerodrome/Velodrome: pool factory & stable flag */
   factoryAddress?: Address;
   aeroStable?: boolean;
+  /** Exact coin addresses for a verified int128 Curve pool; one config per direction. */
+  curveCoins?: Address[];
 };
+
+export type CustomDexRouter = Omit<Partial<DexRouterConfig>, 'address'> & { address: string };
+
+export function validateRouterConfig(router: DexRouterConfig): void {
+  if (![0, 1, 2, 3, 4, 5].includes(router.kind)) throw new Error('Unsupported router kind');
+  if (!Number.isFinite(router.feeBps) || router.feeBps < 0 || router.feeBps >= 10000) throw new Error('Invalid router fee');
+  if ([1, 2, 5].includes(router.kind) && !router.quoterAddress) throw new Error(`${router.name}: quoterAddress required`);
+  if (router.kind === 3 && !router.factoryAddress) throw new Error(`${router.name}: factoryAddress required`);
+  if (router.kind === 4) {
+    const { i, j } = decodeCurveIndices(router.v3FeeTier ?? 1);
+    if (i === j || !router.curveCoins?.[i] || !router.curveCoins?.[j]) throw new Error(`${router.name}: curveCoins mapping required`);
+  }
+}
+
+export function routerSupportsPair(router: DexRouterConfig, tokenIn: Address, tokenOut: Address): boolean {
+  if (router.kind !== 4) return true;
+  const { i, j } = decodeCurveIndices(router.v3FeeTier ?? 1);
+  return router.curveCoins?.[i]?.toLowerCase() === tokenIn.toLowerCase()
+    && router.curveCoins?.[j]?.toLowerCase() === tokenOut.toLowerCase();
+}
 
 /**
  * Packs Curve pool coin indices (i, j) into the 24-bit `fee` field of `SwapHop`.
@@ -232,20 +254,13 @@ export const DEFAULT_DEX_ROUTERS: Record<string, DexRouterConfig[]> = {
 
 export function getRoutersForChain(
   chainKey: string,
-  extraRouters?: Array<{
-    name?: string;
-    address: string;
-    feeBps?: number;
-    kind?: RouterKindId;
-    v3FeeTier?: number;
-    quoterAddress?: string;
-  }>,
+  extraRouters?: CustomDexRouter[],
 ): DexRouterConfig[] {
   const byKey = new Map<string, DexRouterConfig>();
 
   for (const router of DEFAULT_DEX_ROUTERS[chainKey] ?? []) {
     const normalized = getAddress(router.address) as Address;
-    const uniqueKey = `${normalized.toLowerCase()}:${router.kind}:${router.v3FeeTier ?? 0}:${router.aeroStable ? 1 : 0}`;
+    const uniqueKey = `${normalized.toLowerCase()}:${router.kind}:${router.v3FeeTier ?? 0}:${router.aeroStable ? 1 : 0}:${router.factoryAddress?.toLowerCase() ?? ''}`;
     byKey.set(uniqueKey, {
       ...router,
       address: normalized,
@@ -259,46 +274,47 @@ export function getRoutersForChain(
     try {
       const parsed = JSON.parse(rawEnv) as Record<
         string,
-        Array<{
-          name?: string;
-          address: string;
-          feeBps?: number;
-          kind?: RouterKindId;
-          v3FeeTier?: number;
-          quoterAddress?: string;
-        }>
+        CustomDexRouter[]
       >;
       for (const item of parsed[chainKey] ?? []) {
         const normalized = getAddress(item.address) as Address;
-        const uniqueKey = `${normalized.toLowerCase()}:${item.kind ?? 0}:${item.v3FeeTier ?? 0}:0`;
+        const uniqueKey = `${normalized.toLowerCase()}:${item.kind ?? 0}:${item.v3FeeTier ?? 0}:${item.aeroStable ? 1 : 0}:${item.factoryAddress?.toLowerCase() ?? ''}`;
         byKey.set(uniqueKey, {
           name: item.name ?? `CustomRouter(${normalized.slice(0, 8)})`,
           address: normalized,
           protocol: item.kind === 4 ? 'curve' : item.kind === 5 ? 'v3-direct-pool' : 'custom-v2',
           kind: item.kind ?? 0,
+          quoterAddress: item.quoterAddress ? getAddress(item.quoterAddress) as Address : undefined,
+          factoryAddress: item.factoryAddress ? getAddress(item.factoryAddress) as Address : undefined,
+          aeroStable: item.aeroStable,
+          curveCoins: item.curveCoins?.map(a => getAddress(a) as Address),
           feeBps: item.feeBps ?? 30,
           ...(item.v3FeeTier !== undefined ? { v3FeeTier: item.v3FeeTier } : {}),
-          ...(item.quoterAddress ? { quoterAddress: getAddress(item.quoterAddress) as Address } : {}),
         });
       }
-    } catch {
-      // Ignore malformed custom router JSON
+    } catch (error) {
+      throw new Error(`CUSTOM_DEX_ROUTERS_JSON invalid: ${String(error)}`);
     }
   }
 
   for (const item of extraRouters ?? []) {
     const normalized = getAddress(item.address) as Address;
-    const uniqueKey = `${normalized.toLowerCase()}:${item.kind ?? 0}:${item.v3FeeTier ?? 0}:0`;
+    const uniqueKey = `${normalized.toLowerCase()}:${item.kind ?? 0}:${item.v3FeeTier ?? 0}:${item.aeroStable ? 1 : 0}:${item.factoryAddress?.toLowerCase() ?? ''}`;
     byKey.set(uniqueKey, {
       name: item.name ?? `CustomRouter(${normalized.slice(0, 8)})`,
       address: normalized,
       protocol: item.kind === 4 ? 'curve' : item.kind === 5 ? 'v3-direct-pool' : 'custom-v2',
       kind: item.kind ?? 0,
+      quoterAddress: item.quoterAddress ? getAddress(item.quoterAddress) as Address : undefined,
+      factoryAddress: item.factoryAddress ? getAddress(item.factoryAddress) as Address : undefined,
+      aeroStable: item.aeroStable,
+      curveCoins: item.curveCoins?.map(a => getAddress(a) as Address),
       feeBps: item.feeBps ?? 30,
       ...(item.v3FeeTier !== undefined ? { v3FeeTier: item.v3FeeTier } : {}),
-      ...(item.quoterAddress ? { quoterAddress: getAddress(item.quoterAddress) as Address } : {}),
     });
   }
 
-  return [...byKey.values()];
+  const routers = [...byKey.values()];
+  routers.forEach(validateRouterConfig);
+  return routers;
 }

@@ -1,5 +1,5 @@
+import { buildWhitelistCooldownKey } from './cooldown.js';
 import { parseUnits } from 'viem';
-import { buildWhitelistCooldownKey, isOnExecutionCooldown, type ExecutionCooldowns } from './cooldown.js';
 import type { RouterKindId } from '../config/dex-routers.js';
 import type { Address } from '../config/registry.js';
 import type {
@@ -248,6 +248,14 @@ function buildWhitelistPlan(
   };
 }
 
+export function canExecuteArbitrageCandidate(
+  report: ChainOpportunityReport, config: LlmOperatorConfig, candidate: ArbitrageCandidate,
+): boolean {
+  // Synchronization is its own policy-controlled action. Never spend allowlist gas
+  // inside a time-sensitive trade or trade a snapshot taken before synchronization.
+  return !report.arbExecutorPaused && candidate.tokensWhitelistedOnArb && candidate.routersWhitelistedOnArb;
+}
+
 export function buildArbitragePlan(
   candidate: ArbitrageCandidate,
   deadlineSeconds: number,
@@ -333,7 +341,7 @@ function buildFlashloanPlan(
   if (asset.priceUsd && asset.priceUsd > 0 && targetUsd > 0) {
     const tokens = targetUsd / asset.priceUsd;
     const precision = Math.min(asset.decimals, 8);
-    const formatted = tokens.toFixed(precision).replace(/\.?0+$/, '') || '1';
+    const formatted = tokens.toFixed(precision) || '1';
     try {
       const parsed = parseUnits(formatted, asset.decimals);
       if (parsed > 0n && parsed <= asset.balance) {
@@ -350,7 +358,7 @@ function buildFlashloanPlan(
     symbol: asset.symbol,
     decimals: asset.decimals,
     amount,
-    formattedAmount: `${numericAmount.toFixed(Math.min(asset.decimals, 6)).replace(/\.?0+$/, '')} ${asset.symbol}`,
+    formattedAmount: `${numericAmount.toFixed(Math.min(asset.decimals, 6))} ${asset.symbol}`,
     usdValue,
     reason,
   };
@@ -363,7 +371,7 @@ function buildFlashloanPlan(
 export function evaluateDeterministically(
   report: ChainOpportunityReport,
   config: LlmOperatorConfig,
-  recentExecutedKeys: ExecutionCooldowns = new Map(),
+  recentExecutedKeys: Set<string> = new Set(),
   fallbackReason?: string,
   isFastPath = false,
 ): OperatorDecision {
@@ -394,15 +402,17 @@ export function evaluateDeterministically(
   // Priority 1: Profitable Morpho Blue Liquidation
   const bestLiquidation = (report.profitableLiquidations ?? []).find(
     (liq) =>
+      isActionAllowedByMode('EXECUTE_LIQUIDATION', config.mode) && !report.arbExecutorPaused &&
       liq.netProfitUsd >= config.minProfitUsd &&
-      !isOnExecutionCooldown(recentExecutedKeys, `liq:${liq.id}`),
+      !recentExecutedKeys.has(`liq:${liq.id}`),
   );
 
   // Priority 2: Profitable Multi-DEX Arbitrage
   const bestArbitrage = report.profitableCandidates.find(
     (cand) =>
+      isActionAllowedByMode('EXECUTE_ARBITRAGE', config.mode) && canExecuteArbitrageCandidate(report, config, cand) &&
       cand.netProfitUsd >= config.minProfitUsd &&
-      !isOnExecutionCooldown(recentExecutedKeys, `arb:${cand.id}`),
+      !recentExecutedKeys.has(`arb:${cand.id}`),
   );
 
   // Choose whichever yields higher net profit between Liquidation and Arbitrage
@@ -458,21 +468,14 @@ export function evaluateDeterministically(
   // Priority 3: Pending Whitelist Sync (Token or Router)
   const hasPendingWhitelist =
     report.pendingWhitelistAssets.length > 0 || report.pendingWhitelistRouters.length > 0;
-  const pendingWhitelistPlan = buildWhitelistPlan(
-    report.pendingWhitelistAssets,
-    report.pendingWhitelistRouters,
-  );
-  const whitelistCooldownKey = buildWhitelistCooldownKey(
-    report.chain.key,
-    pendingWhitelistPlan.tokensToAllow,
-    pendingWhitelistPlan.routersToAllow,
-  );
+  const pendingPlan = buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters);
+  const whitelistCooldownKey = buildWhitelistCooldownKey(report.chain.key, pendingPlan.tokensToAllow, pendingPlan.routersToAllow);
 
   if (
     config.whitelistAutoSync &&
     hasPendingWhitelist &&
     isActionAllowedByMode('SYNC_WHITELIST', config.mode) &&
-    !isOnExecutionCooldown(recentExecutedKeys, whitelistCooldownKey)
+    !recentExecutedKeys.has(whitelistCooldownKey)
   ) {
     const tokenSymbols = report.pendingWhitelistAssets.map((a) => a.symbol).join(', ');
     const routerNames = report.pendingWhitelistRouters.map((r) => r.name).join(', ');
@@ -486,7 +489,7 @@ export function evaluateDeterministically(
         `. Menjalankan sinkronisasi allowlist otomatis.`,
       chain: report.chain.key,
       blockNumber: report.blockNumber.toString(),
-      whitelistPlan: pendingWhitelistPlan,
+      whitelistPlan: buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters),
       riskAssessment: { level: 'LOW', checksPassed, warnings },
       source: sourceLabel,
       model: isFastPath ? 'fast-path-engine-v2' : 'deterministic-guard-v1',
@@ -500,7 +503,7 @@ export function evaluateDeterministically(
     (asset) =>
       asset.allowedOnFlashExecutor &&
       asset.balance > 0n &&
-      !isOnExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${asset.symbol}`),
+      !recentExecutedKeys.has(`flashloan:${report.chain.key}:${asset.symbol}`),
   );
 
   if (
@@ -571,7 +574,7 @@ function extractJsonObject(rawText: string): Record<string, unknown> {
 export async function evaluateWithLlmOperator(
   report: ChainOpportunityReport,
   config: LlmOperatorConfig,
-  recentExecutedKeys: ExecutionCooldowns = new Map(),
+  recentExecutedKeys: Set<string> = new Set(),
 ): Promise<OperatorDecision> {
   const startTime = Date.now();
 
@@ -599,6 +602,15 @@ export async function evaluateWithLlmOperator(
     }
     throw new Error('LLM_API_KEY wajib diisi untuk mode operator LLM');
   }
+
+  report = { ...report,
+    profitableCandidates: report.profitableCandidates.filter(c =>
+      !recentExecutedKeys.has(`arb:${c.id}`) && canExecuteArbitrageCandidate(report, config, c)),
+    profitableLiquidations: (report.profitableLiquidations ?? []).filter(c =>
+      !report.arbExecutorPaused && !recentExecutedKeys.has(`liq:${c.id}`)),
+    whitelistedAssets: report.whitelistedAssets.filter(a =>
+      !report.flashExecutorPaused && !recentExecutedKeys.has(`flashloan:${report.chain.key}:${a.symbol}`)),
+  };
 
   const stateSummary = {
     chain: {
@@ -631,7 +643,7 @@ export async function evaluateWithLlmOperator(
       usdValue: Math.round(a.usdValue ?? 0),
       allowedOnFlashExecutor: a.allowedOnFlashExecutor,
       allowedOnArbExecutor: a.allowedOnArbExecutor,
-      onCooldown: isOnExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${a.symbol}`),
+      onCooldown: recentExecutedKeys.has(`flashloan:${report.chain.key}:${a.symbol}`),
     })),
     pendingWhitelistAssets: report.pendingWhitelistAssets.map((a) => ({
       symbol: a.symbol,
@@ -658,7 +670,7 @@ export async function evaluateWithLlmOperator(
       netProfitUsd: Number(c.netProfitUsd.toFixed(4)),
       profitable: c.profitable,
       readyToExecute: c.readyToExecute,
-      onCooldown: isOnExecutionCooldown(recentExecutedKeys, `arb:${c.id}`),
+      onCooldown: recentExecutedKeys.has(`arb:${c.id}`),
     })),
     liquidationCandidates: (report.liquidationCandidates ?? []).slice(0, 5).map((l) => ({
       id: l.id,
@@ -669,7 +681,7 @@ export async function evaluateWithLlmOperator(
       repaidUsd: Number(l.repaidUsd.toFixed(2)),
       netProfitUsd: Number(l.netProfitUsd.toFixed(4)),
       profitable: l.profitable,
-      onCooldown: isOnExecutionCooldown(recentExecutedKeys, `liq:${l.id}`),
+      onCooldown: recentExecutedKeys.has(`liq:${l.id}`),
     })),
   };
 
@@ -777,19 +789,15 @@ Format output WAJIB JSON object tanpa markdown tambahan:
 
     if (rawAction === 'EXECUTE_LIQUIDATION') {
       const requestedId = parsed.candidateId ? String(parsed.candidateId) : undefined;
-      const eligibleLiquidations = (report.profitableLiquidations ?? []).filter(
-        (candidate) =>
-          candidate.netProfitUsd >= config.minProfitUsd &&
-          !isOnExecutionCooldown(recentExecutedKeys, `liq:${candidate.id}`),
-      );
       const liqCandidate =
-        eligibleLiquidations.find((candidate) => candidate.id === requestedId) ?? eligibleLiquidations[0];
+        (report.profitableLiquidations ?? []).find((l) => l.id === requestedId) ??
+        (report.profitableLiquidations ?? []).find((l) => l.netProfitUsd >= config.minProfitUsd);
 
-      if (!liqCandidate) {
+      if (!liqCandidate || liqCandidate.netProfitUsd < config.minProfitUsd) {
         return {
           action: 'HOLD',
           confidence,
-          reasoning: `[Guard Override] LLM memilih EXECUTE_LIQUIDATION namun tidak ada posisi yang memenuhi minProfitUsd ($${config.minProfitUsd}) dan bebas cooldown.`,
+          reasoning: `[Guard Override] LLM memilih EXECUTE_LIQUIDATION namun tidak ada posisi yang memenuhi minProfitUsd ($${config.minProfitUsd}).`,
           chain: report.chain.key,
           blockNumber: report.blockNumber.toString(),
           riskAssessment: { level: 'MEDIUM', checksPassed, warnings },
@@ -817,19 +825,15 @@ Format output WAJIB JSON object tanpa markdown tambahan:
 
     if (rawAction === 'EXECUTE_ARBITRAGE') {
       const requestedId = parsed.candidateId ? String(parsed.candidateId) : undefined;
-      const eligibleCandidates = report.profitableCandidates.filter(
-        (item) =>
-          item.netProfitUsd >= config.minProfitUsd &&
-          !isOnExecutionCooldown(recentExecutedKeys, `arb:${item.id}`),
-      );
       const candidate =
-        eligibleCandidates.find((item) => item.id === requestedId) ?? eligibleCandidates[0];
+        report.profitableCandidates.find((c) => c.id === requestedId) ??
+        report.profitableCandidates.find((c) => c.netProfitUsd >= config.minProfitUsd);
 
-      if (!candidate) {
+      if (!candidate || candidate.netProfitUsd < config.minProfitUsd) {
         return {
           action: 'HOLD',
           confidence,
-          reasoning: `[Guard Override] LLM memilih EXECUTE_ARBITRAGE tetapi tidak ada kandidat on-chain yang memenuhi minProfitUsd ($${config.minProfitUsd}) dan bebas cooldown. Catatan LLM: ${reasoning}`,
+          reasoning: `[Guard Override] LLM memilih EXECUTE_ARBITRAGE tetapi tidak ada kandidat on-chain yang memenuhi minProfitUsd ($${config.minProfitUsd}). Catatan LLM: ${reasoning}`,
           chain: report.chain.key,
           blockNumber: report.blockNumber.toString(),
           riskAssessment: {
@@ -881,7 +885,8 @@ Format output WAJIB JSON object tanpa markdown tambahan:
       // Policy Guard: `WHITELIST_AUTO_SYNC=false` must be enforced here too. The system prompt
       // only *asks* the model to consider this flag, so without a hard check a model that
       // ignores it could broadcast allowlist transactions the operator explicitly disabled.
-      if (!config.whitelistAutoSync) {
+      const pendingPlan = buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters);
+      if (!config.whitelistAutoSync || recentExecutedKeys.has(buildWhitelistCooldownKey(report.chain.key, pendingPlan.tokensToAllow, pendingPlan.routersToAllow))) {
         return {
           action: 'HOLD',
           confidence,
@@ -900,37 +905,13 @@ Format output WAJIB JSON object tanpa markdown tambahan:
         };
       }
 
-      const whitelistPlan = buildWhitelistPlan(
-        report.pendingWhitelistAssets,
-        report.pendingWhitelistRouters,
-      );
-      const whitelistKey = buildWhitelistCooldownKey(
-        report.chain.key,
-        whitelistPlan.tokensToAllow,
-        whitelistPlan.routersToAllow,
-      );
-      if (isOnExecutionCooldown(recentExecutedKeys, whitelistKey)) {
-        return {
-          action: 'HOLD',
-          confidence,
-          reasoning: `[Guard Override] Sinkronisasi whitelist untuk target ini masih dalam cooldown. Catatan LLM: ${reasoning}`,
-          chain: report.chain.key,
-          blockNumber: report.blockNumber.toString(),
-          riskAssessment: { level: 'LOW', checksPassed, warnings },
-          source: 'llm',
-          model: config.model,
-          latencyMs: Date.now() - startTime,
-          timestamp: new Date().toISOString(),
-        };
-      }
-
       return {
         action: 'SYNC_WHITELIST',
         confidence,
         reasoning,
         chain: report.chain.key,
         blockNumber: report.blockNumber.toString(),
-        whitelistPlan,
+        whitelistPlan: buildWhitelistPlan(report.pendingWhitelistAssets, report.pendingWhitelistRouters),
         riskAssessment: { level: riskLevel, checksPassed, warnings },
         source: 'llm',
         model: config.model,
@@ -964,15 +945,11 @@ Format output WAJIB JSON object tanpa markdown tambahan:
       }
 
       const requestedSymbol = parsed.flashloanSymbol ? String(parsed.flashloanSymbol).toUpperCase() : undefined;
-      const eligibleFlashloanAssets = report.whitelistedAssets.filter(
-        (asset) =>
-          asset.allowedOnFlashExecutor &&
-          asset.balance > 0n &&
-          !isOnExecutionCooldown(recentExecutedKeys, `flashloan:${report.chain.key}:${asset.symbol}`),
-      );
       const asset =
-        eligibleFlashloanAssets.find((item) => item.symbol.toUpperCase() === requestedSymbol) ??
-        eligibleFlashloanAssets[0];
+        report.whitelistedAssets.find(
+          (a) => a.allowedOnFlashExecutor && a.symbol.toUpperCase() === requestedSymbol,
+        ) ??
+        report.whitelistedAssets.find((a) => a.allowedOnFlashExecutor && a.balance > 0n);
 
       if (!asset) {
         return {

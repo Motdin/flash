@@ -205,3 +205,9 @@ By setting `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `tools/.env`, the daem
 - `/broadcast on` or `/broadcast off` — Enables or disables live on-chain transaction broadcasting (and resets the circuit breaker).
 - `/profit <usd>` — Updates the minimum net USD profit threshold (e.g., `/profit 15`).
 - `/ask <question>` *(or any plain-text message)* — Chat directly with the LLM Operator with full context of live on-chain data.
+
+### Registry persistence and safety
+
+Compose mounts the `evm` directory, not just `deployments.json`, so registry writes can use an atomic rename. It recompiles contract artifacts on startup because this mount hides image-built artifacts. Independent registry field changes are merged under a filesystem lock; conflicting updates fail and require a reload. If a process crashes while holding `evm/deployments.json.lock`, stop all writers and inspect the registry before manually removing that lock directory. Never remove a lock held by a running writer.
+
+Liquidation discovery paginates the indexer (default maximum 50 pages, configurable via `MORPHO_LIQUIDATION_MAX_PAGES`), then verifies positions and quotes on-chain. Pagination caps and unavailable indexers appear in scan warnings; discovery is not guaranteed exhaustive. These local checks are not a substitute for fork testing and an independent contract audit before deployment.

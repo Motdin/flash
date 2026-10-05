@@ -5,6 +5,9 @@ import {
     IPOCERC20,
     IPOCMorphoFlashLoanCallback,
     IPOCV2Router,
+    IPOCAeroRouter,
+    IPOCMorphoLiquidateCallback,
+    MorphoMarketParams,
     MorphoAtomicArbPOC
 } from "../src/poc/MorphoAtomicArbPOC.sol";
 
@@ -262,5 +265,109 @@ contract MorphoAtomicArbPOCTest {
             deadline: type(uint256).max,
             profitReceiver: PROFIT_RECEIVER
         });
+    }
+}
+
+contract POCMockLiquidator {
+    function liquidate(MorphoMarketParams calldata market, address, uint256 seized, uint256, bytes calldata data)
+        external returns (uint256, uint256)
+    {
+        uint256 repay = seized;
+        require(POCMockToken(market.collateralToken).transfer(msg.sender, seized), "collateral");
+        IPOCMorphoLiquidateCallback(msg.sender).onMorphoLiquidate(repay, data);
+        require(POCMockToken(market.loanToken).transferFrom(msg.sender, address(this), repay), "repayment");
+        return (seized, repay);
+    }
+}
+contract POCMockAeroRouter is IPOCAeroRouter {
+    function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, Route[] calldata routes, address to, uint256)
+        external returns (uint256[] memory amounts)
+    {
+        uint256 amountOut = routes[0].stable ? amountIn * 55 / 100 : amountIn * 2;
+        require(amountOut >= amountOutMin, "min-out");
+        POCMockToken(routes[0].from).transferFrom(msg.sender, address(this), amountIn);
+        POCMockToken(routes[0].to).transfer(to, amountOut);
+        amounts = new uint256[](2); amounts[0] = amountIn; amounts[1] = amountOut;
+    }
+}
+contract AtomicArbRegressionTest {
+    function testLiquidationPreservesPrefundedCollateral() external { _liquidation(11, 10, true); }
+    function testPrefundedCollateralCannotSubsidizeUnprofitableLiquidation() external { _liquidation(9, 10, false); }
+    function _liquidation(uint256 n, uint256 d, bool shouldSucceed) private {
+        POCMockToken loan = new POCMockToken();
+        POCMockToken collateral = new POCMockToken();
+        POCMockLiquidator morpho = new POCMockLiquidator();
+        POCMockV2Router router = new POCMockV2Router(n, d);
+        address[] memory tokens = new address[](2); tokens[0] = address(loan); tokens[1] = address(collateral);
+        address[] memory routers = new address[](1); routers[0] = address(router);
+        MorphoAtomicArbPOC executor = new MorphoAtomicArbPOC(address(morpho), tokens, routers);
+        collateral.mint(address(morpho), 100e18);
+        collateral.mint(address(executor), 50e18);
+        loan.mint(address(router), 1000e18);
+        MorphoAtomicArbPOC.LiquidationParams memory params = MorphoAtomicArbPOC.LiquidationParams({
+            marketParams: MorphoMarketParams(address(loan), address(collateral), address(1), address(2), 86e16),
+            borrower: address(3), seizedAssets: 100e18, repaidShares: 0,
+            collateralSwapHop: MorphoAtomicArbPOC.SwapHop(address(router), MorphoAtomicArbPOC.RouterKind.V2, 0, false, address(0)),
+            minLoanTokenOut: 1, minProfit: 1, deadline: type(uint256).max, profitReceiver: address(0xBEEF)
+        });
+        (bool ok,) = address(executor).call(abi.encodeCall(executor.executeLiquidation, (params)));
+        require(ok == shouldSucceed, "profit guard");
+        require(collateral.balanceOf(address(executor)) == 50e18, "prefunded collateral spent");
+        if (ok) {
+            require(loan.balanceOf(address(morpho)) == 100e18, "repayment");
+            require(loan.balanceOf(address(0xBEEF)) == 10e18, "realized profit");
+        }
+    }
+    function testSameAeroRouterDifferentPoolTypesAreValid() external {
+        POCMockToken loan = new POCMockToken();
+        POCMockToken intermediate = new POCMockToken();
+        POCMockMorpho morpho = new POCMockMorpho();
+        POCMockAeroRouter router = new POCMockAeroRouter();
+        address[] memory tokens = new address[](2); tokens[0] = address(loan); tokens[1] = address(intermediate);
+        address[] memory routers = new address[](1); routers[0] = address(router);
+        MorphoAtomicArbPOC executor = new MorphoAtomicArbPOC(address(morpho), tokens, routers);
+        loan.mint(address(morpho), 1000e18);
+        loan.mint(address(router), 2000e18);
+        intermediate.mint(address(router), 2000e18);
+        uint256 profit = executor.executeMultiDexArbitrage(MorphoAtomicArbPOC.MultiDexArbitrageParams({
+            loanToken: address(loan), intermediateToken: address(intermediate),
+            firstHop: MorphoAtomicArbPOC.SwapHop(address(router), MorphoAtomicArbPOC.RouterKind.AERODROME, 0, false, address(1)),
+            secondHop: MorphoAtomicArbPOC.SwapHop(address(router), MorphoAtomicArbPOC.RouterKind.AERODROME, 0, true, address(1)),
+            loanAmount: 1000e18, minIntermediateAmount: 1900e18, minFinalAmount: 1050e18,
+            minProfit: 50e18, deadline: type(uint256).max, profitReceiver: address(0xBEEF)
+        }));
+        require(profit == 100e18, "stable/volatile route");
+    }
+}
+
+contract POCMockLegacyCurve {
+    POCMockToken private immutable tokenIn;
+    POCMockToken private immutable tokenOut;
+    constructor(POCMockToken a, POCMockToken b) { tokenIn = a; tokenOut = b; }
+    function exchange(int128 i, int128 j, uint256 dx, uint256 minDy) external {
+        require(i == 0 && j == 1 && dx * 2 >= minDy, "indices/output");
+        tokenIn.transferFrom(msg.sender, address(this), dx);
+        tokenOut.transfer(msg.sender, dx * 2);
+        // Old StableSwap pools deliberately have no return data.
+    }
+}
+contract LegacyCurveRegressionTest {
+    function testCurveExchangeWithoutReturnData() external {
+        POCMockToken a = new POCMockToken(); POCMockToken b = new POCMockToken();
+        POCMockMorpho morpho = new POCMockMorpho();
+        POCMockLegacyCurve curve = new POCMockLegacyCurve(a, b);
+        POCMockV2Router second = new POCMockV2Router(55, 100);
+        address[] memory tokens = new address[](2); tokens[0] = address(a); tokens[1] = address(b);
+        address[] memory routers = new address[](2); routers[0] = address(curve); routers[1] = address(second);
+        MorphoAtomicArbPOC executor = new MorphoAtomicArbPOC(address(morpho), tokens, routers);
+        a.mint(address(morpho), 1000e18); b.mint(address(curve), 2000e18); a.mint(address(second), 2000e18);
+        uint256 profit = executor.executeMultiDexArbitrage(MorphoAtomicArbPOC.MultiDexArbitrageParams({
+            loanToken: address(a), intermediateToken: address(b),
+            firstHop: MorphoAtomicArbPOC.SwapHop(address(curve), MorphoAtomicArbPOC.RouterKind.CURVE, 1, false, address(0)),
+            secondHop: MorphoAtomicArbPOC.SwapHop(address(second), MorphoAtomicArbPOC.RouterKind.V2, 0, false, address(0)),
+            loanAmount: 1000e18, minIntermediateAmount: 1900e18, minFinalAmount: 1050e18,
+            minProfit: 50e18, deadline: type(uint256).max, profitReceiver: address(0xBEEF)
+        }));
+        require(profit == 100e18, "curve optional return");
     }
 }

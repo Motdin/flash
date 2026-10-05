@@ -11,6 +11,8 @@ import {
 import type { EvmChainConfig } from '../config/chains.js';
 import {
   decodeCurveIndices,
+  routerSupportsPair,
+  type CustomDexRouter,
   getRoutersForChain,
   type DexRouterConfig,
   type RouterKindId,
@@ -181,14 +183,7 @@ export type OpportunityScanOptions = {
   maxSlippageBps?: number;
   maxAssetsToPair?: number;
   enableTriangularArb?: boolean;
-  extraRouters?: Array<{
-    name?: string;
-    address: string;
-    feeBps?: number;
-    kind?: RouterKindId;
-    v3FeeTier?: number;
-    quoterAddress?: string;
-  }>;
+  extraRouters?: CustomDexRouter[];
 };
 
 export function applySlippageBps(amount: bigint, slippageBps: number): bigint {
@@ -316,17 +311,20 @@ export function computeLoanAmountForUsd(
     return { amount: 0n, actualUsd: 0 };
   }
   const desiredTokens = targetUsd / asset.priceUsd;
-  const precision = Math.min(asset.decimals, 8);
-  const formatted = desiredTokens.toFixed(precision).replace(/\.?0+$/, '') || '0';
+  const precision = Math.min(asset.decimals, 100);
+  if (!Number.isFinite(desiredTokens) || !Number.isInteger(asset.decimals) || asset.decimals < 0
+      || !Number.isFinite(maxPoolShareBps) || maxPoolShareBps <= 0 || maxPoolShareBps > 10000) return { amount: 0n, actualUsd: 0 };
+  const formatted = desiredTokens.toFixed(precision);
   let requested = 0n;
   try {
     requested = parseUnits(formatted, asset.decimals);
   } catch {
     requested = 0n;
   }
+  if (requested <= 0n) return { amount: 0n, actualUsd: 0 };
   const maxPoolAmount = (asset.balance * BigInt(maxPoolShareBps)) / 10_000n;
-  const cap = maxPoolAmount > 0n ? maxPoolAmount : asset.balance;
-  const finalAmount = requested > 0n && requested <= cap ? requested : cap;
+  const cap = maxPoolAmount;
+  const finalAmount = requested <= cap ? requested : cap;
   const actualTokens = Number(formatUnits(finalAmount, asset.decimals));
   return {
     amount: finalAmount,
@@ -350,6 +348,12 @@ export function selectOptimalArbitrageTier(
     ...best,
     optimalContinuousLoanUsd: continuousPeakUsd ?? best.loanAmountUsd,
   };
+}
+
+/** Route identity never depends on untrusted/non-unique token symbols or display names. */
+export function arbitrageRouteKey(chainKey: string, loanToken: Address, steps: SwapHopStepQuote[]): string {
+  return [chainKey, loanToken.toLowerCase(), ...steps.map(s =>
+    [s.tokenIn.toLowerCase(), s.tokenOut.toLowerCase(), s.router.toLowerCase(), s.kind, s.fee, s.stable, s.factory.toLowerCase()].join('/'))].join(':');
 }
 
 export function evaluateArbitrageQuote(params: {
@@ -401,7 +405,7 @@ export function evaluateArbitrageQuote(params: {
     const requiredUsd = Math.max(0, minProfitUsd + gasCostUsd);
     const reqTokens = requiredUsd / loanAsset.priceUsd;
     const precision = Math.min(loanAsset.decimals, 8);
-    const formatted = reqTokens.toFixed(precision).replace(/\.?0+$/, '') || '0';
+    const formatted = reqTokens.toFixed(precision) || '0';
     try {
       const parsed = parseUnits(formatted, loanAsset.decimals);
       if (parsed > 0n) requiredProfitUnits = parsed;
@@ -448,7 +452,7 @@ export function evaluateArbitrageQuote(params: {
   ];
 
   return {
-    id: `${chainKey}:${loanAsset.symbol}->${intermediateAsset.symbol}@${firstRouter.name}->${secondRouter.name}($${Math.round(loanAmountUsd)})`,
+    id: `${arbitrageRouteKey(chainKey, loanAsset.address, steps)}:${loanAmount}`,
     chain: chainKey,
     loanToken: loanAsset.address,
     loanSymbol: loanAsset.symbol,
@@ -542,7 +546,7 @@ export function evaluateMultiHopArbitrageQuote(params: {
     const requiredUsd = Math.max(0, minProfitUsd + multiHopGasCostUsd);
     const reqTokens = requiredUsd / loanAsset.priceUsd;
     const precision = Math.min(loanAsset.decimals, 8);
-    const formatted = reqTokens.toFixed(precision).replace(/\.?0+$/, '') || '0';
+    const formatted = reqTokens.toFixed(precision) || '0';
     try {
       const parsed = parseUnits(formatted, loanAsset.decimals);
       if (parsed > 0n) requiredProfitUnits = parsed;
@@ -587,7 +591,7 @@ export function evaluateMultiHopArbitrageQuote(params: {
   const profitable = grossProfit >= requiredProfitUnits && netProfitUsd >= minProfitUsd;
 
   return {
-    id: `${chainKey}:tri:${loanAsset.symbol}->${pathSymbols}->${loanAsset.symbol}@${routerNames}($${Math.round(loanAmountUsd)})`,
+    id: `${arbitrageRouteKey(chainKey, loanAsset.address, steps)}:${loanAmount}`,
     chain: chainKey,
     loanToken: loanAsset.address,
     loanSymbol: loanAsset.symbol,
@@ -633,19 +637,16 @@ export function evaluateMultiHopArbitrageQuote(params: {
 }
 
 function inferNativePriceUsd(chain: EvmChainConfig, assets: ScannedAsset[]): number {
-  const nativeUpper = chain.nativeSymbol.toUpperCase();
-  const wrappedMatch = assets.find((asset) => {
-    const sym = asset.symbol.toUpperCase();
-    return (
-      asset.priceUsd &&
-      asset.priceUsd > 0 &&
-      (sym === nativeUpper || sym === `W${nativeUpper}` || (nativeUpper === 'ETH' && sym === 'WETH'))
-    );
-  });
-  if (wrappedMatch?.priceUsd) return wrappedMatch.priceUsd;
-  if (nativeUpper === 'ETH') return 2500;
-  if (nativeUpper.includes('USD')) return 1;
-  return 10;
+  const wrapped: Record<string, string> = {
+    ethereum: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+    base: '0x4200000000000000000000000000000000000006',
+    optimism: '0x4200000000000000000000000000000000000006',
+    arbitrum: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
+  };
+  const now = Date.now() / 1000;
+  return assets.find(a => a.address.toLowerCase() === wrapped[chain.key]
+    && a.priceUsd !== null && Number.isFinite(a.priceUsd) && a.priceUsd > 0
+    && a.priceTimestamp !== null && a.priceTimestamp <= now + 300 && now - a.priceTimestamp <= 3600)?.priceUsd ?? 0;
 }
 
 type QuoteCallRequest = {
@@ -655,22 +656,32 @@ type QuoteCallRequest = {
   tokenOut: Address;
 };
 
-function isRouterQuoteable(router: DexRouterConfig): boolean {
-  if (router.kind === 1 || router.kind === 2 || router.kind === 5) {
-    return Boolean(router.quoterAddress);
-  }
-  if (router.kind === 3) return Boolean(router.factoryAddress);
-  return true;
-}
-
-async function readSingleRouterQuote(
+export async function readSingleRouterQuote(
   client: PublicClient,
   req: QuoteCallRequest,
 ): Promise<bigint> {
   const { router, amountIn, tokenIn, tokenOut } = req;
-  if (!isRouterQuoteable(router)) return 0n;
+  if (!routerSupportsPair(router, tokenIn, tokenOut)) return 0n;
   try {
-    if ((router.kind === 1 || router.kind === 2 || router.kind === 5) && router.quoterAddress) {
+    if (router.kind === 5) {
+      if (!router.quoterAddress) return 0n;
+      const abi = parseAbi(['function token0() view returns (address)', 'function token1() view returns (address)', 'function fee() view returns (uint24)']);
+      const [token0, token1, fee] = await Promise.all([
+        client.readContract({ address: router.address, abi, functionName: 'token0' }),
+        client.readContract({ address: router.address, abi, functionName: 'token1' }),
+        client.readContract({ address: router.address, abi, functionName: 'fee' }),
+      ]);
+      if (!([token0.toLowerCase(), token1.toLowerCase()].includes(tokenIn.toLowerCase())
+        && [token0.toLowerCase(), token1.toLowerCase()].includes(tokenOut.toLowerCase()))) return 0n;
+      return readSingleRouterQuote(client, { ...req, router: { ...router, kind: 2, v3FeeTier: fee } });
+    }
+    if (router.kind === 4) {
+      const { i, j } = decodeCurveIndices(router.v3FeeTier ?? 1);
+      const abi = parseAbi(['function coins(uint256) view returns (address)']);
+      const [coinIn, coinOut] = await Promise.all([i, j].map(index => client.readContract({ address: router.address, abi, functionName: 'coins', args: [BigInt(index)] })));
+      if (coinIn.toLowerCase() !== tokenIn.toLowerCase() || coinOut.toLowerCase() !== tokenOut.toLowerCase()) return 0n;
+    }
+    if ((router.kind === 1 || router.kind === 2) && router.quoterAddress) {
       const res = await client.readContract({
         address: router.quoterAddress,
         abi: v3QuoterV2Abi,
@@ -708,8 +719,6 @@ async function readSingleRouterQuote(
       return amounts[amounts.length - 1] ?? 0n;
     }
 
-    if (router.kind === 5) return 0n;
-
     if (router.kind === 4) {
       const { i, j } = decodeCurveIndices(router.v3FeeTier ?? 1);
       return await client.readContract({
@@ -737,13 +746,19 @@ async function batchReadMultiDexQuotes(
   calls: QuoteCallRequest[],
 ): Promise<bigint[]> {
   if (calls.length === 0) return [];
-  const quoteableCalls = calls.filter((req) => isRouterQuoteable(req.router));
-  if (quoteableCalls.length === 0) return calls.map(() => 0n);
-
+  if (calls.some(c => c.router.kind === 4 || c.router.kind === 5)) {
+    const normal = calls.filter(c => c.router.kind !== 4 && c.router.kind !== 5);
+    const outputs = await batchReadMultiDexQuotes(client, normal);
+    let index = 0;
+    const result: bigint[] = [];
+    for (const call of calls) result.push(call.router.kind === 4 || call.router.kind === 5
+      ? await readSingleRouterQuote(client, call) : outputs[index++]);
+    return result;
+  }
   try {
-    const contracts = quoteableCalls.map((req) => {
+    const contracts = calls.map((req) => {
       const { router, amountIn, tokenIn, tokenOut } = req;
-      if ((router.kind === 1 || router.kind === 2 || router.kind === 5) && router.quoterAddress) {
+      if ((router.kind === 1 || router.kind === 2) && router.quoterAddress) {
         return {
           address: router.quoterAddress,
           abi: v3QuoterV2Abi,
@@ -801,10 +816,10 @@ async function batchReadMultiDexQuotes(
       contracts,
     });
 
-    const quoteableOutputs = results.map((res, idx) => {
+    return results.map((res, idx) => {
       if (res.status !== 'success' || !res.result) return 0n;
-      const kind = quoteableCalls[idx].router.kind;
-      if (kind === 1 || kind === 2 || kind === 5) {
+      const kind = calls[idx].router.kind;
+      if (kind === 1 || kind === 2) {
         const tuple = res.result as readonly [bigint, bigint, number, bigint];
         return tuple[0] ?? 0n;
       }
@@ -813,12 +828,6 @@ async function batchReadMultiDexQuotes(
       }
       const arr = res.result as readonly bigint[];
       return arr[arr.length - 1] ?? 0n;
-    });
-
-    let quoteIndex = 0;
-    return calls.map((req) => {
-      if (!isRouterQuoteable(req.router)) return 0n;
-      return quoteableOutputs[quoteIndex++] ?? 0n;
     });
   } catch {
     const output: bigint[] = [];
@@ -949,12 +958,6 @@ export async function scanChainOpportunities(
   }
 
   const configuredRouters = getRoutersForChain(options.chain.key, options.extraRouters);
-  for (const router of configuredRouters) {
-    if (!isRouterQuoteable(router)) {
-      const requirement = router.kind === 3 ? 'factoryAddress' : 'quoterAddress V3';
-      warnings.push(`Router ${router.name} dilewati karena konfigurasi quote tidak lengkap: tambahkan ${requirement} yang cocok di CUSTOM_DEX_ROUTERS_JSON.`);
-    }
-  }
   const routerWhitelists: RouterWhitelistState[] = [];
 
   for (const router of configuredRouters) {
@@ -1023,9 +1026,7 @@ export async function scanChainOpportunities(
   const pendingWhitelistRouters = routerWhitelists.filter((item) => item.needsArbWhitelist);
 
   // Scan Multi-DEX (V2 + V3 + Aerodrome + Curve) arbitrage quotes across 5-point Golden-Section loan tiers
-  const activeRouters = configuredRouters.filter(
-    (router, idx) => routerWhitelists[idx]?.hasBytecode && isRouterQuoteable(router),
-  );
+  const activeRouters = configuredRouters.filter((_, idx) => routerWhitelists[idx]?.hasBytecode);
   const topAssets = eligibleAssets.slice(0, maxAssetsToPair);
   const allTierCandidates: ArbitrageCandidate[] = [];
 
@@ -1252,7 +1253,7 @@ export async function scanChainOpportunities(
   // Group by route pair and pick the optimal loan size tier + parabolic interpolation
   const byRouteKey = new Map<string, ArbitrageCandidate[]>();
   for (const cand of allTierCandidates) {
-    const routeKey = `${cand.isMultiHop ? 'tri:' : ''}${cand.loanSymbol}->${cand.intermediateSymbol}@${cand.firstRouterName}->${cand.secondRouterName}`;
+    const routeKey = arbitrageRouteKey(options.chain.key, cand.loanToken, cand.steps ?? []);
     const list = byRouteKey.get(routeKey) ?? [];
     list.push(cand);
     byRouteKey.set(routeKey, list);
@@ -1267,16 +1268,18 @@ export async function scanChainOpportunities(
 
   const profitableCandidates = arbitrageCandidates.filter((item) => item.profitable);
 
-  // Scan Morpho Blue liquidations and reconcile the pre-liquidation watchlist from GraphQL.
+  // Scan Morpho Blue Liquidations (GraphQL + On-Chain Indexer + Pre-Liquidation Watchlist)
   const liquidationScan = await scanMorphoLiquidations({
     chain: options.chain,
+    rpcUrl: options.rpcUrl,
     routers: activeRouters,
+    assets: options.assets,
     gasCostUsd: estimatedGasCostUsd,
     minProfitUsd,
     maxSlippageBps,
   });
-  warnings.push(...liquidationScan.warnings);
   const liquidationCandidates = liquidationScan.candidates;
+  warnings.push(...liquidationScan.warnings);
   const profitableLiquidations = liquidationCandidates.filter((item) => item.profitable);
 
   return {

@@ -86,3 +86,23 @@ test('handleTelegramCommand updates mode, broadcast, and minProfitUsd accurately
   assert.equal(triggered, 1);
   assert.match(scanRes.reply, /Siklus scan & evaluasi LLM selesai/);
 });
+
+test('liquidation mode is available and an empty /profit does not disable minimum profit', async () => {
+  const state = createMockRuntimeState();
+  const handlers = { getState: () => state, triggerNow: async () => {}, updateConfig: (patch: object) => Object.assign(state.config, patch) };
+  await handleTelegramCommand('/mode liquidation', handlers); assert.equal(state.config.mode, 'liquidation');
+  await handleTelegramCommand('/profit', handlers); assert.equal(state.config.minProfitUsd, 5);
+});
+
+test('/ask serializes BigInt plans and calls the LLM instead of failing locally', async () => {
+  const state = createMockRuntimeState();
+  state.config.apiKey = 'FAKE-KEY';
+  state.recentHistory = [{ decision: { arbitragePlan: { loanAmount: 123n } } }] as unknown as OperatorRuntimeState['recentHistory'];
+  const originalFetch = globalThis.fetch;
+  let body = '';
+  globalThis.fetch = async (_url, options) => { body = String(options?.body); return new Response(JSON.stringify({ choices: [{ message: { content: 'fixture answer' } }] })); };
+  try {
+    const result = await handleTelegramCommand('/ask status?', { getState: () => state, triggerNow: async () => {}, updateConfig: () => {} });
+    assert.match(result.reply, /fixture answer/); assert.match(body, /123/);
+  } finally { globalThis.fetch = originalFetch; }
+});

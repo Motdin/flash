@@ -95,8 +95,10 @@ export async function allowlistTarget(target: AllowlistTarget): Promise<Allowlis
   const sleep = target.sleep ?? defaultSleep;
   const base = { label: target.label, address: target.address };
 
-  if (await target.isAllowed()) {
-    return { ...base, status: 'already-allowed', attempts: 0 };
+  try {
+    if (await target.isAllowed()) return { ...base, status: 'already-allowed', attempts: 0 };
+  } catch (error) {
+    return { ...base, status: 'failed', error: describeError(error), attempts: 0 };
   }
 
   let lastError: unknown;
@@ -114,8 +116,10 @@ export async function allowlistTarget(target: AllowlistTarget): Promise<Allowlis
       if (attempt === attemptsAllowed) break;
       await sleep(retryDelayMs);
       // An earlier attempt may have been mined even though the RPC reported a nonce error.
-      if (await target.isAllowed()) {
-        return { ...base, status: 'already-allowed', attempts: attempt };
+      try {
+        if (await target.isAllowed()) return { ...base, status: 'already-allowed', attempts: attempt };
+      } catch (error) {
+        return { ...base, status: 'failed', error: describeError(error), attempts: attempt };
       }
     }
   }

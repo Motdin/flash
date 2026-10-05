@@ -226,6 +226,7 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
     address private activeLoanToken;
     uint256 private activeLoanAmount;
     uint256 private activeBalanceBefore;
+    uint256 private activeCollateralBefore;
     bytes32 private activeRouteHash;
     address private activeV3PoolCallback;
 
@@ -284,8 +285,8 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
 
     /// @notice Pre-approve a whitelisted router or Morpho singleton once to eliminate SSTORE gas overhead during swaps.
     function setRouterPreApproval(address token, address spender, uint256 amount) external onlyOwnerOrOperator {
-        if (!allowedToken[token]) revert TokenNotAllowed();
-        if (spender != morpho && !allowedRouter[spender]) revert RouterNotAllowed();
+        if (amount != 0 && !allowedToken[token]) revert TokenNotAllowed();
+        if (amount != 0 && spender != morpho && !allowedRouter[spender]) revert RouterNotAllowed();
         _forceApprove(token, spender, amount);
         emit RouterPreApprovalUpdated(token, spender, amount);
     }
@@ -413,6 +414,7 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
         uint256 balanceBefore = IPOCERC20(loanToken).balanceOf(address(this));
         bytes memory callbackData = abi.encode(params);
 
+        activeCollateralBefore = IPOCERC20(params.marketParams.collateralToken).balanceOf(address(this));
         activeMode = CallbackMode.LIQUIDATION;
         activeLoanToken = loanToken;
         activeLoanAmount = 0;
@@ -475,8 +477,9 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
         if (loanToken != activeLoanToken) revert LoanStateMismatch();
         if (block.timestamp > params.deadline) revert DeadlineExpired();
 
-        uint256 collateralBalance = IPOCERC20(collateralToken).balanceOf(address(this));
-        if (collateralBalance == 0) revert InsufficientOutput();
+        uint256 collateralAfter = IPOCERC20(collateralToken).balanceOf(address(this));
+        if (collateralAfter <= activeCollateralBefore) revert InsufficientOutput();
+        uint256 collateralBalance = collateralAfter - activeCollateralBefore;
 
         _executeHop(
             params.collateralSwapHop,
@@ -487,6 +490,9 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
             params.deadline
         );
 
+        if (IPOCERC20(collateralToken).balanceOf(address(this)) != activeCollateralBefore) {
+            revert ResidualIntermediateToken();
+        }
         uint256 requiredFinalBalance = activeBalanceBefore + repaidAssets + params.minProfit;
         if (IPOCERC20(loanToken).balanceOf(address(this)) < requiredFinalBalance) {
             revert InsufficientProfit();
@@ -718,8 +724,12 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
             int128 i = int128(int24(hop.fee >> 12));
             int128 j = int128(int24(hop.fee & 0xFFF));
             _ensureAllowance(tokenIn, hop.router, amountIn);
-            uint256 dy = IPOCCurvePool(hop.router).exchange(i, j, amountIn, amountOutMin);
-            if (dy < amountOutMin) revert InsufficientOutput();
+            uint256 beforeOut = IPOCERC20(tokenOut).balanceOf(address(this));
+            // Legacy StableSwap pools may return no data. Measure actual output instead.
+            (bool ok,) = hop.router.call(abi.encodeCall(IPOCCurvePool.exchange, (i, j, amountIn, amountOutMin)));
+            if (!ok || IPOCERC20(tokenOut).balanceOf(address(this)) < beforeOut + amountOutMin) {
+                revert InsufficientOutput();
+            }
         } else {
             // RouterKind.V3_DIRECT_POOL: call Uniswap V3 pool directly without SwapRouter
             address token0 = IPOCV3Pool(hop.router).token0();
@@ -782,6 +792,8 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
             params.firstHop.router == params.secondHop.router
                 && params.firstHop.fee == params.secondHop.fee
                 && params.firstHop.kind == params.secondHop.kind
+                && params.firstHop.stable == params.secondHop.stable
+                && params.firstHop.factory == params.secondHop.factory
         ) revert InvalidRoute();
         if (block.timestamp > params.deadline) revert DeadlineExpired();
         if (!allowedToken[params.loanToken] || !allowedToken[params.intermediateToken]) {
@@ -858,6 +870,7 @@ contract MorphoAtomicArbPOC is IPOCMorphoFlashLoanCallback, IPOCMorphoLiquidateC
         activeLoanToken = address(0);
         activeLoanAmount = 0;
         activeBalanceBefore = 0;
+        activeCollateralBefore = 0;
         activeRouteHash = bytes32(0);
         activeV3PoolCallback = address(0);
     }
