@@ -27,6 +27,7 @@ import type { ScannedAsset } from './scanner.js';
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11' as Address;
 const REQUEST_TIMEOUT_MS = 15_000;
 const ESTIMATED_ARB_GAS_UNITS = 280_000n;
+const DEFAULT_MAX_ASSETS_TO_PAIR = 11;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
 
 const flashLoanExecutorAbi = parseAbi([
@@ -185,6 +186,33 @@ export type OpportunityScanOptions = {
   enableTriangularArb?: boolean;
   extraRouters?: CustomDexRouter[];
 };
+
+/**
+ * Pick the route-search universe deterministically. If an ArbExecutor is available,
+ * only tokens both eligible in the current scan and allowed on that executor can
+ * participate in executable route quotes. The cap is applied after filtering and
+ * sorting by funded USD value so a long tail of unrelated eligible assets cannot
+ * crowd out the configured/allowlisted token set.
+ */
+export function selectRouteAssets(
+  assets: ScannedAsset[],
+  arbAllowedTokenMap: ReadonlyMap<string, boolean>,
+  maxAssetsToPair = DEFAULT_MAX_ASSETS_TO_PAIR,
+  requireArbWhitelist = true,
+): ScannedAsset[] {
+  const limit = Number.isSafeInteger(maxAssetsToPair) && maxAssetsToPair > 0
+    ? maxAssetsToPair
+    : DEFAULT_MAX_ASSETS_TO_PAIR;
+  const eligible = assets.filter((asset) => asset.eligible);
+  const candidates = requireArbWhitelist
+    ? eligible.filter((asset) => arbAllowedTokenMap.get(asset.address.toLowerCase()) === true)
+    : eligible;
+
+  return [...candidates]
+    .sort((a, b) => (b.usdValue ?? 0) - (a.usdValue ?? 0)
+      || a.address.toLowerCase().localeCompare(b.address.toLowerCase()))
+    .slice(0, limit);
+}
 
 export function applySlippageBps(amount: bigint, slippageBps: number): bigint {
   if (amount <= 0n) return 0n;
@@ -853,7 +881,14 @@ export async function scanChainOpportunities(
   ];
   const minProfitUsd = options.minProfitUsd ?? 5;
   const maxSlippageBps = options.maxSlippageBps ?? 30;
-  const maxAssetsToPair = options.maxAssetsToPair ?? 6;
+  const requestedMaxAssetsToPair = options.maxAssetsToPair
+    ?? Number(process.env.ARB_MAX_ASSETS_TO_PAIR ?? DEFAULT_MAX_ASSETS_TO_PAIR);
+  const maxAssetsToPair = Number.isSafeInteger(requestedMaxAssetsToPair) && requestedMaxAssetsToPair > 0
+    ? requestedMaxAssetsToPair
+    : DEFAULT_MAX_ASSETS_TO_PAIR;
+  if (maxAssetsToPair !== requestedMaxAssetsToPair) {
+    warnings.push(`ARB_MAX_ASSETS_TO_PAIR must be a positive integer; using default ${DEFAULT_MAX_ASSETS_TO_PAIR}`);
+  }
   const enableTriangularArb = options.enableTriangularArb ?? (process.env.TRIANGULAR_ARB_ENABLED !== 'false');
 
   const client = createPublicClient({
@@ -1027,7 +1062,12 @@ export async function scanChainOpportunities(
 
   // Scan Multi-DEX (V2 + V3 + Aerodrome + Curve) arbitrage quotes across 5-point Golden-Section loan tiers
   const activeRouters = configuredRouters.filter((_, idx) => routerWhitelists[idx]?.hasBytecode);
-  const topAssets = eligibleAssets.slice(0, maxAssetsToPair);
+  const topAssets = selectRouteAssets(
+    eligibleAssets,
+    arbAllowedTokenMap,
+    maxAssetsToPair,
+    Boolean(arbExecutor),
+  );
   const allTierCandidates: ArbitrageCandidate[] = [];
 
   if (activeRouters.length >= 2 && topAssets.length >= 2) {
@@ -1296,6 +1336,8 @@ export async function scanChainOpportunities(
     arbExecutorPaused,
     tokenWhitelists,
     routerWhitelists,
+    routeScanAssets: topAssets.map(({ symbol, address }) => ({ symbol, address })),
+    routeScanAssetLimit: maxAssetsToPair,
     whitelistedAssets,
     pendingWhitelistAssets,
     pendingWhitelistRouters,
