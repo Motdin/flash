@@ -161,6 +161,9 @@ export type ChainOpportunityReport = {
   arbExecutorPaused?: boolean;
   tokenWhitelists: TokenWhitelistState[];
   routerWhitelists: RouterWhitelistState[];
+   /** Eligible, Arb-allowlisted token set actually used for 2-hop route quotes. */
+  routeScanAssets?: Array<{ address: Address; symbol: string }>;
+  routeScanAssetLimit?: number;
   whitelistedAssets: TokenWhitelistState[];
   pendingWhitelistAssets: TokenWhitelistState[];
   pendingWhitelistRouters: RouterWhitelistState[];
